@@ -1,0 +1,138 @@
+diff --git a/src/holosoma_retargeting/holosoma_retargeting/config_types/data_type.py b/src/holosoma_retargeting/holosoma_retargeting/config_types/data_type.py
+index 7476404..3a3e6a5 100644
+--- a/src/holosoma_retargeting/holosoma_retargeting/config_types/data_type.py
++++ b/src/holosoma_retargeting/holosoma_retargeting/config_types/data_type.py
+@@ -175,6 +175,24 @@ SMPLX_DEMO_JOINTS = [
+ 
+ # Joint mappings - organized by (data_format, robot_type)
+ JOINTS_MAPPINGS = {
++    ("lafan", "t2"): {
++        'Spine2': 'trunk_center_link',
++        'Hips': 'waist_link',
++        'LeftUpLeg': 'left_hip_pitch_link',
++        'RightUpLeg': 'right_hip_pitch_link',
++        'LeftLeg': 'left_knee_pitch_link',
++        'RightLeg': 'right_knee_pitch_link',
++        'LeftArm': 'left_shoulder_roll_link',
++        'RightArm': 'right_shoulder_roll_link',
++        'LeftForeArm': 'left_elbow_yaw_link',
++        'RightForeArm': 'right_elbow_yaw_link',
++        'LeftHand': 'left_wrist_roll_link',
++        'RightHand': 'right_wrist_roll_link',
++        'LeftFoot': 'left_ankle_pitch_link',
++        'RightFoot': 'right_ankle_pitch_link',
++        'LeftToeBase': 'left_foot_sphere_5_link',
++        'RightToeBase': 'right_foot_sphere_5_link',
++    },
+     ("lafan", "g1"): {
+         "Spine1": "pelvis_contour_link",
+         "LeftUpLeg": "left_hip_pitch_link",
+diff --git a/src/holosoma_retargeting/holosoma_retargeting/config_types/robot.py b/src/holosoma_retargeting/holosoma_retargeting/config_types/robot.py
+index e4c1393..dc0820c 100644
+--- a/src/holosoma_retargeting/holosoma_retargeting/config_types/robot.py
++++ b/src/holosoma_retargeting/holosoma_retargeting/config_types/robot.py
+@@ -18,6 +18,7 @@ class RobotDefaults(TypedDict):
+ _ROBOT_DEFAULTS: dict[str, RobotDefaults] = {
+     "g1": {"robot_dof": 29, "robot_height": 1.32, "object_name": "ground"},
+     "t1": {"robot_dof": 23, "robot_height": 1.2, "object_name": "ground"},
++    "t2": {"robot_dof": 31, "robot_height": 1.4, "object_name": "ground"},
+ }
+ 
+ 
+@@ -141,7 +142,7 @@ class RobotConfig:
+                 "left_ankle_roll_sphere_4_link",
+                 "right_ankle_roll_sphere_4_link",
+             ]
+-        if self.robot_type == "t1":
++        if self.robot_type in ("t1", "t2"):
+             return [
+                 "left_foot_sphere_1_link",
+                 "right_foot_sphere_1_link",
+diff --git a/src/holosoma_retargeting/holosoma_retargeting/src/interaction_mesh_retargeter.py b/src/holosoma_retargeting/holosoma_retargeting/src/interaction_mesh_retargeter.py
+index 4de725d..a8741d1 100644
+--- a/src/holosoma_retargeting/holosoma_retargeting/src/interaction_mesh_retargeter.py
++++ b/src/holosoma_retargeting/holosoma_retargeting/src/interaction_mesh_retargeter.py
+@@ -139,34 +139,24 @@ class InteractionMeshRetargeter:
+ 
+         self.nq_a = len(self.q_a_indices)
+ 
+-        # Create complete limits with floating base (-inf, inf) and actuated joint limits
+-        n_floating_base = 7
+-        joint_names = [self.robot_model.joint(i).name for i in range(self.robot_model.njnt)]
+-        actuated_joints = [(i, name) for i, name in enumerate(joint_names) if name]  # Filter out None names
+-
+-        large_number = 1e6
+-        complete_lower_limits = np.concatenate(
+-            [-large_number * np.ones(n_floating_base), self.robot_model.jnt_range[[i for i, _ in actuated_joints], 0]]
+-        )
+-        complete_upper_limits = np.concatenate(
+-            [large_number * np.ones(n_floating_base), self.robot_model.jnt_range[[i for i, _ in actuated_joints], 1]]
+-        )
+-
+-        self.q_a_lb = complete_lower_limits[self.q_a_indices]
+-        self.q_a_ub = complete_upper_limits[self.q_a_indices]
+-
+-        self.q_a_lb[np.array(list(self.task_constants.MANUAL_LB.keys())).astype(int)] = list(
+-            self.task_constants.MANUAL_LB.values()
+-        )
+-        self.q_a_ub[np.array(list(self.task_constants.MANUAL_UB.keys())).astype(int)] = list(
+-            self.task_constants.MANUAL_UB.values()
+-        )
+-
+-        # Prevent too much waist twist
+-        self.Q_diag = np.zeros(self.nq_a) * 1e-3
+-        self.Q_diag[np.array(list(self.task_constants.MANUAL_COST.keys())).astype(int)] = list(
+-            self.task_constants.MANUAL_COST.values()
+-        )
++        # T2 compatibility: free roots have names; limits use qpos addresses.
++        lower = np.full(self.nq, -1e6)
++        upper = np.full(self.nq, 1e6)
++        for joint in range(self.robot_model.njnt):
++            if self.robot_model.jnt_type[joint] in (mujoco.mjtJoint.mjJNT_HINGE, mujoco.mjtJoint.mjJNT_SLIDE):
++                if self.robot_model.jnt_limited[joint]:
++                    address = int(self.robot_model.jnt_qposadr[joint])
++                    lower[address], upper[address] = self.robot_model.jnt_range[joint]
++        for index, value in self.task_constants.MANUAL_LB.items():
++            lower[int(index)] = value
++        for index, value in self.task_constants.MANUAL_UB.items():
++            upper[int(index)] = value
++        self.q_a_lb = lower[self.q_a_indices]
++        self.q_a_ub = upper[self.q_a_indices]
++        cost = np.zeros(self.nq)
++        for index, value in self.task_constants.MANUAL_COST.items():
++            cost[int(index)] = value
++        self.Q_diag = cost[self.q_a_indices]
+ 
+         self.w_nominal_tracking_init = w_nominal_tracking_init
+         self.nominal_tracking_tau = nominal_tracking_tau
+@@ -417,7 +407,9 @@ class InteractionMeshRetargeter:
+             q_locked_list = np.zeros((num_frames, self.nq))
+             q_locked_list[0, self.q_a_indices] = q_a_init
+ 
+-        q_locked_list[:, -7:] = object_poses_augmented
++        # robot_only has no object qpos; do not overwrite its final seven hinges.
++        if self.has_dynamic_object:
++            q_locked_list[:, -7:] = object_poses_augmented
+         q = np.copy(q_locked_list[0])
+         retargeted_motions = [q]
+ 
+@@ -1263,6 +1255,7 @@ class InteractionMeshRetargeter:
+         Fast analytic version: J_qdot = J_v @ T(q)
+         """
+ 
++        body_idx = int(np.asarray(body_idx).item())
+         p_body = np.asarray(p_body, dtype=float).reshape(3)
+ 
+         # 1) Make sure kinematics are current once
+@@ -1273,9 +1266,9 @@ class InteractionMeshRetargeter:
+         p_WB = self.robot_data.xpos[body_idx]
+ 
+         if input_world:
+-            p_W = p_body.astype(np.float64).reshape(3, 1)
++            p_W = p_body.astype(np.float64).reshape(3)
+         else:
+-            p_W = (p_WB + R_WB @ p_body).astype(np.float64).reshape(3, 1)
++            p_W = (p_WB + R_WB @ p_body).astype(np.float64).reshape(3)
+ 
+         # 3) J_v: translational Jacobian wrt generalized velocities (3 x nv)
+         Jp = np.zeros((3, self.robot_model.nv), dtype=np.float64, order="C")

@@ -1,5 +1,7 @@
 # [RSS 2026] Perceptive Humanoid Parkour: Chaining Dynamic Human Skills via Motion Matching
 
+T2 adaptation: [中文适配说明](README.zh-CN.md)
+
 Zhen Wu\*, Xiaoyu Huang\*, Lujie Yang\*, Yuanhang Zhang, Xi Chen,
 Pieter Abbeel†, Rocky Duan†, Angjoo Kanazawa†, Carmelo Sferrazza†, Guanya Shi†, C. Karen Liu†
 

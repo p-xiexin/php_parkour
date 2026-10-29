@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "motion-matching"
 version = "0.1.0"
-description = "Database-driven motion matching pipeline for the Unitree G1 humanoid."
+description = "Database-driven motion matching pipeline for the Unitree G1 and Booster T2 humanoids."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -46,4 +46,8 @@ motion_matching = [
     "assets/robots/unitree_description/urdf/g1/*.urdf",
     "assets/robots/unitree_description/meshes/g1/*.STL",
     "assets/robots/unitree_description/meshes/g1/*.obj",
+    "assets/robots/booster_t2/mjcf/*.xml",
+    "assets/robots/booster_t2/meshes/*.STL",
+    "assets/robots/booster_t2/LICENSE",
+    "assets/robots/booster_t2/NOTICE",
 ]

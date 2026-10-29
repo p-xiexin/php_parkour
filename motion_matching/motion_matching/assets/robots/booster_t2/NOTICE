@@ -1,0 +1,11 @@
+Booster T2 31-joint fist-hand model and referenced mesh assets
+
+Source project: booster_whole_body_teleoperation
+Original asset path: booster_deploy/assets/t2/t2_31dof_fc.xml
+Copyright [2026] [Booster Robotics Technology Co., Ltd ("Booster Robotics")]
+Licensed under the Apache License, Version 2.0. See LICENSE.
+
+This distribution uses the existing PHP T2 motion-processing model variant:
+visual/debug sphere markers do not participate in collisions, and two jointless
+hand contact helper bodies are retained. Packaging only relocates mesh paths
+to the adjacent meshes directory; it does not change model parameters.

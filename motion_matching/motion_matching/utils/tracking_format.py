@@ -79,13 +79,17 @@ def _angular_velocity(q1: np.ndarray, q2: np.ndarray, dt: float) -> np.ndarray:
     return (2.0 / dt) * dq[1:] / dq[0]
 
 
-def qpos_to_tracking(qpos: np.ndarray, fps: int) -> dict[str, np.ndarray]:
-    """Convert ``(N, 36)`` qpos to the FAR-tracking schema.
+def qpos_to_tracking(qpos: np.ndarray, fps: int, *, robot_spec=None) -> dict[str, np.ndarray]:
+    """Convert PHP ``(N, 7 + J)`` qpos to the FAR-tracking schema.
+
+    ``robot_spec`` selects native joint/body order; omitted preserves G1 remapping.
 
     ``qpos`` layout is ``[root_quat_wxyz, root_pos, dof29]`` (the
     motion-matching convention). MuJoCo uses ``[root_pos, root_quat_wxyz,
     dof29]``, so the layout is swapped once before calling FK.
     """
+    if robot_spec is not None:
+        return _native_qpos_to_tracking(qpos, fps, robot_spec)
     qpos = np.asarray(qpos, dtype=np.float32)
     if qpos.ndim != 2 or qpos.shape[1] != 7 + _EXPECTED_JOINTS:
         raise ValueError(
@@ -135,3 +139,30 @@ def qpos_to_tracking(qpos: np.ndarray, fps: int) -> dict[str, np.ndarray]:
         "body_lin_vel_w": body_lin_vel_w[:, _BODY_MAPPING],
         "body_ang_vel_w": body_ang_vel_w[:, _BODY_MAPPING],
     }
+
+
+def _native_qpos_to_tracking(qpos: np.ndarray, fps: int, spec) -> dict[str, np.ndarray]:
+    """Use native joints/bodies with the original tracking derivative rules."""
+    qpos = np.asarray(qpos, dtype=np.float32)
+    model, data = spec.model, mj.MjData(spec.model)
+    positions = np.empty((len(qpos), len(spec.body_ids), 3), dtype=np.float32)
+    rotations = np.empty((*positions.shape[:2], 4), dtype=np.float32)
+    for i, pose in enumerate(spec.to_mujoco_qpos(qpos)):
+        data.qpos[:] = pose
+        mj.mj_forward(model, data)
+        positions[i], rotations[i] = data.xpos[spec.body_ids], data.xquat[spec.body_ids]
+    dt = 1. / fps
+    angular = np.zeros_like(positions)
+    for i in range(len(qpos)):
+        a, b = max(0, i - 1), min(len(qpos) - 1, i + 1)
+        for j in range(len(spec.body_ids)):
+            angular[i, j] = _angular_velocity(rotations[a, j], rotations[b, j], (b - a) * dt)
+    return {"fps": np.array([fps], dtype=np.int64),
+            "joint_pos": qpos[:, 7:],
+            "joint_vel": np.gradient(qpos[:, 7:], dt, axis=0).astype(np.float32),
+            "body_pos_w": positions, "body_quat_w": rotations,
+            "body_lin_vel_w": np.gradient(positions, dt, axis=0).astype(np.float32),
+            "body_ang_vel_w": angular,
+            "joint_names": np.asarray(spec.joint_names), "body_names": np.asarray(spec.body_names),
+            "robot_name": np.asarray(spec.robot_id),
+            "root_body_name": np.asarray(model.body(spec.root_body_id).name)}

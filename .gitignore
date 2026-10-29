@@ -26,12 +26,15 @@ motions/
 .ruff_cache/
 .pytest_cache/
 
-# Motion matching ships a small source motion and G1 robot geometry. Keep
+# Motion matching ships a small source motion and robot geometry. Keep
 # these intentional assets even though generated motion/mesh files are ignored.
-!motion_matching/assets/robot_motions/
-!motion_matching/assets/robot_motions/*.npz
-!motion_matching/assets/robots/
-!motion_matching/assets/robots/**
+!motion_matching/motion_matching/assets/robot_motions/
+!motion_matching/motion_matching/assets/robot_motions/*.npz
+!motion_matching/motion_matching/assets/robots/
+!motion_matching/motion_matching/assets/robots/**
 
 # User-specific optional service configuration
 .env.local
+
+# Local tools, experiments and generated data
+/.cache/

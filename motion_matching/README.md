@@ -1,5 +1,7 @@
 # Motion matching
 
+T2 adaptation: [中文适配说明](../README.zh-CN.md)
+
 [Project overview](../README.md)
 
 Generate parkour motion/terrain datasets for the Unitree G1.

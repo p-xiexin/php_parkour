@@ -1,3 +1,6 @@
 # Robot geometry is source data, not reviewable text.
 motion_matching/**/assets/robots/**/*.obj binary
 motion_matching/**/assets/robots/**/*.STL binary
+
+# Unified-diff context lines can contain an intentional single space.
+thirdparty/*.patch whitespace=-blank-at-eol

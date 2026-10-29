@@ -1,4 +1,4 @@
-"""Packaged G1 assets and the user-configurable motion database cache."""
+"""Packaged robot assets and the user-configurable motion database cache."""
 
 import os
 from importlib.resources import files
@@ -19,6 +19,7 @@ DATABASE_DIR: Path = Path(
 
 G1_URDF: str = str(ROBOTS_DIR / "unitree_description" / "urdf" / "g1" / "main_mesh_collision_halfspherehand.urdf")
 G1_MJCF: str = str(ROBOTS_DIR / "unitree_description" / "mjcf" / "g1.xml")
+T2_MJCF: str = str(ROBOTS_DIR / "booster_t2" / "mjcf" / "t2_31dof_fc.xml")
 
 
 def db_path(relative: str) -> str:
