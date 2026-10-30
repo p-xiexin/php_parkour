@@ -26,13 +26,18 @@ def add_world_scene(server: viser.ViserServer) -> Any:
     """
     server.scene.add_frame(
         "/world",
+        # Explicit defaults from the upstream-pinned Viser 1.0.27.
+        axes_length=0.5, axes_radius=0.025, origin_radius=0.05, scale=1.0,
         position=np.array([0.0, 0.0, 0.0], dtype=np.float32),
         wxyz=np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
     )
     server.scene.add_grid(
         "/xy_grid", width=100.0, height=100.0, position=np.array([0.0, 0.0, 0.0], dtype=np.float32), plane="xy"
     )
-    return server.scene.add_frame("/robot_root", show_axes=True)
+    return server.scene.add_frame(
+        "/robot_root", show_axes=True,
+        axes_length=0.5, axes_radius=0.025, origin_radius=0.05, scale=1.0,
+    )
 
 
 def load_g1_viser_urdf(server: viser.ViserServer) -> ViserUrdf:

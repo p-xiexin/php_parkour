@@ -17,7 +17,7 @@ Holosoma 人体输入 → T2 重定向 → PHP 构库与镜像
 
 ## 数据准备
 
-数据来源、使用规模、下载地址，以及各数据集到 Holosoma 输入格式的转换步骤，见[数据准备文档](DATA_PREPARATION.zh-CN.md)。主流程假定人体数据已准备为 Holosoma 可直接读取的输入，从人体到 T2 的重定向开始。
+当前使用 LAFAN1、Holosoma、PHP G1、PARC、NUS 和 HOLD。数据来源、使用规模、下载地址，以及各数据集到 Holosoma 输入格式的转换步骤，见[数据准备文档](DATA_PREPARATION.zh-CN.md)。主流程假定人体数据已准备为 Holosoma 可直接读取的输入，从人体到 T2 的重定向开始。
 
 ## 环境与模型
 
@@ -62,7 +62,36 @@ DATA_FORMAT_CONSTANTS["lafan"]["default_scale_factor"] = 1.4 / 1.7
 ```
 
 上游重定向入口为 `holosoma_retargeting/examples/robot_retarget.py`。输入目录由 `data_path` 指定，`task_name` 对应序列文件名（不含扩展名）。
-重定向后输出包含 `qpos` 和 `fps` 的 NPZ；`qpos` 为 `(T,38)`，采用 `[root_xyz, root_quat_wxyz, joint31]` 排列，供下文构库使用。
+重定向后输出包含 `qpos` 和 `fps` 的 NPZ；T2 机器人部分为 `(T,38)`，采用 `[root_xyz, root_quat_wxyz, joint31]` 排列。含动态物体的原生结果会在末尾追加物体位姿，需与机器人部分分开保存。
+
+NUS 使用准备好的 30 Hz 关节位置 NPZ，格式为 `nus`，按输入中的主体身高缩放，并以 `root_quaternion` 的首帧初始化根朝向。无障碍重定向示例：
+
+```bash
+python -m holosoma_retargeting.examples.robot_retarget \
+    --task-type robot_only --robot t2 --data-format nus \
+    --data-path /path/to/nus/positions --task-name 0017_RunningOnBench001 \
+    --save-dir /path/to/nus/retargeted \
+    --robot-config.robot-type t2 \
+    --robot-config.robot-urdf-file "$PWD/motion_matching/motion_matching/assets/robots/booster_t2/mjcf/t2_31dof_fc.xml" \
+    --task-config.ground-range -10 10 --retargeter.foot-sticking-tolerance 0.02
+```
+
+当前 NUS 重定向仅包含地面，不包含障碍接触约束。CMU 使用相同的 `robot_only` 命令，将格式改为 `cmu`、输入目录改为 `holosoma_cmu`、序列名改为 `127_21` 等；输入为已转换的关节位置 NPZ，保留 ASF/AMC 根朝向。
+
+PARC 使用独立的 `parc` 格式和 `climbing` 任务。每条输入目录包含 `motion.npz` 与配对地形资产；人体和地形按同一比例缩放，保留源坐标及根朝向。
+
+```bash
+python -m holosoma_retargeting.examples.robot_retarget \
+    --task-type climbing --robot t2 --data-format parc \
+    --data-path /path/to/parc/holosoma_parc --task-name beyond_speed_vault_001_aug001_dm \
+    --save-dir /path/to/parc/retargeted \
+    --robot-config.robot-type t2 \
+    --robot-config.robot-urdf-file "$PWD/motion_matching/motion_matching/assets/robots/booster_t2/mjcf/t2_31dof_fc.xml" \
+    --retargeter.foot-sticking-tolerance 0.02
+```
+
+
+HOLD 使用相同的 `climbing` 命令，将 `--data-format` 改为 `hold`、输入目录改为准备好的 `holosoma_hold`、`--task-name` 改为 `I1` 等序列名。箱体逐帧位姿参与重定向；原生结果额外包含末尾 7 维箱体位姿。
 
 ## 数据格式
 
@@ -137,12 +166,24 @@ save_motion_npz(
 )
 ```
 
+## 可视化
+
+使用同一入口查看重定向、构库和 motion matching 结果：
+
+```bash
+python -m motion_matching.motion_visualizer \
+    --motion-file /path/to/retargeted /path/to/databases /path/to/matched_motions
+```
+
+`--motion-file` 支持多个 NPZ、BIN 或目录。默认自动识别机器人，可用 `--robot t2` 或 `--robot g1` 筛选。
+
+打开终端显示的浏览器地址，通过 `Robot`、`Stage`、`Seq` 选择机器人、阶段和序列。`Retargeted` 为 Holosoma 重定向 NPZ，`Database` 为 PHP 构库 BIN，`Motion matching` 为合成训练 NPZ。
+
 ## 输出与支持范围
 
 重定向 NPZ、BIN 中的原始/镜像范围，以及合成后的 tracking NPZ 是不同阶段的输出。
-查看构库序列时，应从实际 BIN 范围恢复机器人姿态；查看训练参考时，使用 tracking NPZ。
 
-默认 `motion_matching.run` 命令行注册表、交互式播放器及训练入口面向 G1；
+上游 `motion_matching.run` 命令行、`play_database` 及训练入口仍使用 G1 配置；
 T2 移动合成使用上述 Python 接口。
 
 适配不增加额外的时序平滑、足底接触或重心修正；上游算法自带的平滑与约束保持。
@@ -151,4 +192,4 @@ T2 移动合成使用上述 Python 接口。
 
 - `motion_matching/motion_matching/robots/`：读取 T2 原生模型、关节轴、静态绑定旋转和身体映射。
 - `generate_t2_database.py` 与匹配/导出接口：支持 31 关节骨架、T2 镜像和 tracking 格式。
-- `thirdparty/holosoma_t2.patch`：Holosoma 固定为 `4a0bf04cde5930af5ed59da797568d32be972525`；补丁注册 T2 模型参数及 LAFAN 映射，按 qpos 地址处理关节限位，修复 `robot_only` 下的对象位姿赋值，并适配 MuJoCo Jacobian 参数。优化器、预处理与约束的其他逻辑保持上游实现。
+- `thirdparty/holosoma_t2.patch`：Holosoma 固定为 `4a0bf04cde5930af5ed59da797568d32be972525`；补丁注册 T2 模型及 LAFAN、SMPL-X、NUS、CMU、PARC、HOLD 关节映射；NUS/PARC/HOLD 使用源根朝向初始化，PARC/HOLD 保留动作与配对场景的共同坐标。其余兼容项包括 qpos 关节限位地址、`robot_only` 对象位姿赋值和 MuJoCo Jacobian 参数；优化器与约束保持上游实现。

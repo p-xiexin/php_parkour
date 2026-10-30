@@ -1,12 +1,11 @@
 """Packaged robot assets and the user-configurable motion database cache."""
 
 import os
-from importlib.resources import files
 from pathlib import Path
 
 # Wheels installed by pip expose these resources as ordinary files. Both model
 # loaders need the complete relative mesh hierarchy alongside the model file.
-PKG_ROOT: Path = Path(str(files("motion_matching"))).resolve()
+PKG_ROOT: Path = Path(__file__).resolve().parents[1]
 ASSETS_DIR: Path = PKG_ROOT / "assets"
 ROBOTS_DIR: Path = ASSETS_DIR / "robots"
 ROBOT_MOTIONS_DIR: Path = ASSETS_DIR / "robot_motions"

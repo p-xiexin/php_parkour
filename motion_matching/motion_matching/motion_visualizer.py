@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""URDF Animation Script
+"""Robot motion visualizer with tracking and retargeted motion playback.
 
-Animate a URDF robot using motion data from .npz files.
+Animate G1 and T2 using NPZ motions and BIN databases.
 
 Usage:
     python motion_visualizer.py --motion-file motion.npz --terrain-file terrain.obj
@@ -15,20 +15,29 @@ Supported motion file format (FAR-tracking schema, produced by run.py):
 from __future__ import annotations
 
 import time
+import shutil
 from pathlib import Path
-from typing import Any, List
+from typing import Literal
+from threading import Lock
 
 import numpy as np
 import trimesh
 import tyro
-from scipy.spatial.transform import Rotation
+from scipy.spatial.transform import Rotation, Slerp
 
 import viser
 from viser.extras import ViserUrdf
 
+from motion_matching.core.database import MotionMatchingDatabase
+from motion_matching.kinematics import quat
+from motion_matching.metadata.constants import G1_JOINT_AXES, G1_BONE_LEFT_FOOT, G1_BONE_RIGHT_FOOT
 from motion_matching.io.motion_io import save_edited_motion_npz
-from motion_matching.utils import G1_URDF
+from motion_matching.robots import get_robot_spec
 from motion_matching.scenarios.builtin import VEL_CMD_MAPPING
+from motion_matching.scenarios.skill_registry import SKILL_REGISTRY, resolve_paths
+from motion_matching.utils import G1_URDF
+from motion_matching.viz.scene import add_world_scene
+from motion_matching.utils.math_utils import quat_to_scaled_angle_axis
 
 
 # Reverse of the joint reordering applied by qpos_to_tracking — restores the
@@ -83,14 +92,18 @@ def reconstruct_box_mesh(
 
 def load_motion_data(
     motion_file: Path,
+    *,
+    robot_spec=None,
+    range_index: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, np.ndarray | None]:
     """Load motion data in the FAR-tracking schema produced by run.py.
 
-    The tracking schema stores joints in a custom policy order; the loader
+    G1 and T2 accept MuJoCo ``qpos``; T2 tracking uses joint/body names.
+    Official G1 native tracking stores ``[xyz, wxyz, joints]`` in ``joint_pos``.
+    G1 tracking stores joints in a custom policy order; the loader
     applies the reverse mapping so ``joint_data`` is in URDF-actuated order.
     A synthetic ``qpos_data`` (``[quat_wxyz, pos, joints]``) is reconstructed
-    from ``body_pos_w[:, 0]`` / ``body_quat_w[:, 0]`` so the save handler can
-    reuse the existing resampling utilities.
+    from ``body_pos_w[:, 0]`` / ``body_quat_w[:, 0]``.
 
     Returns:
         joint_data: (T, 29) joints in URDF order
@@ -99,10 +112,48 @@ def load_motion_data(
         fps:        Frames per second
         vel_cmd_data: optional (T, D)
     """
+    if motion_file.suffix == ".bin":
+        db = MotionMatchingDatabase()
+        db.load_from_file(str(motion_file))
+        index = 0 if range_index is None else range_index
+        start, stop = db.range_starts[index], db.range_stops[index]
+        positions, rotations = db.bone_positions[start:stop], db.bone_rotations[start:stop]
+        if robot_spec is not None:
+            qpos = robot_spec.decode_bones_to_qpos(positions, rotations)
+        else:
+            angles = quat_to_scaled_angle_axis(rotations[:, -29:].reshape(-1, 4)).reshape(-1, 29, 3)
+            joints = np.sum(angles * G1_JOINT_AXES, axis=-1)
+            world_rotations, world_positions = quat.fk(rotations, positions, db.bone_parents)
+            qpos = np.concatenate((world_rotations[:, 1], world_positions[:, 1], joints), axis=1)
+        roots = np.concatenate((qpos[:, 4:7], qpos[:, :4]), axis=1)
+        return qpos[:, 7:], roots, qpos, 60.0, None
+
     if motion_file.suffix != ".npz":
-        raise ValueError(f"Unsupported file format: {motion_file.suffix}. Only .npz is supported.")
+        raise ValueError(f"Unsupported file format: {motion_file.suffix}. Use .npz or .bin.")
 
     with np.load(motion_file, allow_pickle=False) as data:
+        if robot_spec is None and "qpos" in data.files:
+            qpos = data["qpos"]
+            php_qpos = np.concatenate((qpos[:, 3:7], qpos[:, :3], qpos[:, 7:]), axis=1)
+            fps = float(data["fps"].item())
+            return qpos[:, 7:], qpos[:, :7], php_qpos, fps, None
+
+        if robot_spec is not None:
+            fps = float(data["fps"].item())
+            if "qpos" in data.files:
+                qpos_data = robot_spec.from_mujoco_qpos(data["qpos"])
+            else:
+                root = data["body_names"].tolist().index(data["root_body_name"].item())
+                joint_names = data["joint_names"].tolist()
+                joints = [joint_names.index(name) for name in robot_spec.joint_names]
+                qpos_data = np.concatenate(
+                    (data["body_quat_w"][:, root], data["body_pos_w"][:, root],
+                     data["joint_pos"][:, joints]), axis=1,
+                )
+            root_data = np.concatenate((qpos_data[:, 4:7], qpos_data[:, :4]), axis=1)
+            vel_cmd = data["vel_cmd"] if "vel_cmd" in data.files else None
+            return qpos_data[:, 7:], root_data, qpos_data, fps, vel_cmd
+
         required = ("fps", "joint_pos", "body_pos_w", "body_quat_w")
         missing = [k for k in required if k not in data.files]
         if missing:
@@ -119,6 +170,11 @@ def load_motion_data(
             raise ValueError("fps must be positive and finite")
 
         joints = data["joint_pos"]
+        if joints.ndim == 2 and joints.shape[1] == 36:
+            qpos = np.concatenate((joints[:, 3:7], joints[:, :3], joints[:, 7:]), axis=1)
+            vel_cmd = data["vel_cmd"] if "vel_cmd" in data.files else None
+            return joints[:, 7:], joints[:, :7], qpos, fps, vel_cmd
+
         positions = data["body_pos_w"]
         quaternions = data["body_quat_w"]
         if joints.ndim != 2 or joints.shape[1] != 29 or len(joints) == 0:
@@ -155,797 +211,548 @@ def load_motion_data(
     return joint_data, root_data, qpos_data, fps, vel_cmd_data
 
 
-def create_animation_controls(
-    server: viser.ViserServer,
-) -> tuple[viser.GuiInputHandle[bool], viser.GuiInputHandle[float], viser.GuiInputHandle[float], viser.GuiButtonHandle]:
-    """Create animation control GUI elements."""
-
-    with server.gui.add_folder("Animation Controls"):
-        play_button = server.gui.add_checkbox("Play Animation", initial_value=False)
-
-        speed_slider = server.gui.add_slider("Speed", min=0.1, max=5.0, step=0.1, initial_value=1.0)
-
-        frame_slider = server.gui.add_slider(
-            "Frame",
-            min=0,
-            max=100,  # Will be updated based on motion data
-            step=1,
-            initial_value=0,
-        )
-
-        save_button = server.gui.add_button("Save Motion")
-
-    return play_button, speed_slider, frame_slider, save_button
-
-
-def create_joint_value_sliders(
-    server: viser.ViserServer,
-    joint_names: tuple[str, ...],
-    joint_limits: dict[str, tuple[float | None, float | None]],
-    viser_urdf: ViserUrdf,
-    play_button: viser.GuiInputHandle[bool] | None = None,
-) -> tuple[list[viser.GuiSliderHandle], dict]:
-    """Create interactive DOF slider elements."""
-
-    joint_sliders = []
-
-    # Shared state to prevent callback conflicts
-    slider_state = {"updating_from_animation": False, "last_manual_update": 0.0}
-
-    with server.gui.add_folder("Joint Values (DOF)"):
-        for joint_name in joint_names:
-            # Get joint limits
-            lower, upper = joint_limits.get(joint_name, (None, None))
-            lower = lower if lower is not None else -np.pi
-            upper = upper if upper is not None else np.pi
-
-            # Ensure initial value is within bounds
-            initial_value = max(lower, min(upper, 0.0))
-
-            # Create slider for each joint
-            joint_slider = server.gui.add_slider(
-                label=joint_name,
-                min=lower,
-                max=upper,
-                step=0.001,
-                initial_value=initial_value,
-                marks=((lower, f"{lower:.2f}"), (0.0, "0"), (upper, f"{upper:.2f}"))
-                if abs(upper - lower) > 0.1 and lower <= 0.0 <= upper
-                else None,
-            )
-
-            joint_sliders.append(joint_slider)
-
-    # Set up callbacks for manual control
-    def update_urdf_from_sliders() -> None:
-        # Only pause if this is a manual user interaction, not an animation update
-        if not slider_state["updating_from_animation"]:
-            joint_values = np.array([s.value for s in joint_sliders])
-            viser_urdf.update_cfg(joint_values)
-            slider_state["last_manual_update"] = time.time()
-            # Pause animation when user manually adjusts sliders
-            if play_button is not None:
-                play_button.value = False
-
-    for slider in joint_sliders:
-        slider.on_update(lambda _: update_urdf_from_sliders())
-
-    return joint_sliders, slider_state
-
-
-def create_root_transform_controls(server: viser.ViserServer) -> tuple[list[viser.GuiSliderHandle], viser.FrameHandle]:
-    """Create root transform control sliders and frame handle."""
-
-    root_sliders = []
-
-    with server.gui.add_folder("Root Transform"):
-        # Translation controls
-        x_slider = server.gui.add_slider("X Position", min=-5.0, max=5.0, step=0.01, initial_value=0.0)
-        y_slider = server.gui.add_slider("Y Position", min=-5.0, max=5.0, step=0.01, initial_value=0.0)
-        z_slider = server.gui.add_slider("Z Position", min=-2.0, max=3.0, step=0.01, initial_value=0.0)
-
-        # Rotation controls (Euler angles for intuitive control)
-        roll_slider = server.gui.add_slider("Roll", min=-np.pi, max=np.pi, step=0.01, initial_value=0.0)
-        pitch_slider = server.gui.add_slider("Pitch", min=-np.pi, max=np.pi, step=0.01, initial_value=0.0)
-        yaw_slider = server.gui.add_slider("Yaw", min=-np.pi, max=np.pi, step=0.01, initial_value=0.0)
-
-        root_sliders = [x_slider, y_slider, z_slider, roll_slider, pitch_slider, yaw_slider]
-
-    # Create root frame handle
-    root_frame = server.scene.add_frame("/robot_root", show_axes=True)
-
-    # Set up callbacks to update root frame
-    def update_root_transform() -> None:
-        x, y, z, roll, pitch, yaw = [s.value for s in root_sliders]
-        root_frame.position = (x, y, z)
-
-        # Convert Euler angles to quaternion
-        r = Rotation.from_euler("xyz", [roll, pitch, yaw])
-        root_frame.wxyz = r.as_quat()[[3, 0, 1, 2]]  # Convert to wxyz format
-
-    for slider in root_sliders:
-        slider.on_update(lambda _: update_root_transform())
-
-    return root_sliders, root_frame
-
-
-def update_root_transform_from_data(
-    root_sliders: list[viser.GuiSliderHandle], root_frame: viser.FrameHandle, root_data: np.ndarray, frame_idx: int
-) -> None:
-    """Update root transform from motion data [x, y, z, qw, qx, qy, qz]."""
-    if root_data is None or len(root_data) == 0:
-        return
-
-    # Get root transform for current frame
-    root_transform = root_data[frame_idx]
-    x, y, z = root_transform[:3]
-
-    # Handle quaternion (qw, qx, qy, qz format)
-    if len(root_transform) >= 7:
-        qw, qx, qy, qz = root_transform[3:7]
-
-        # Convert quaternion to Euler angles for slider display
-        r = Rotation.from_quat([qx, qy, qz, qw])  # scipy uses xyzw format
-        roll, pitch, yaw = r.as_euler("xyz")
-
-        # Update sliders (without triggering callbacks to avoid conflicts)
-        root_sliders[0].value = float(x)  # X
-        root_sliders[1].value = float(y)  # Y
-        root_sliders[2].value = float(z)  # Z
-        root_sliders[3].value = float(roll)  # Roll
-        root_sliders[4].value = float(pitch)  # Pitch
-        root_sliders[5].value = float(yaw)  # Yaw
-
-        # Update root frame directly
-        root_frame.position = (x, y, z)
-        root_frame.wxyz = (qw, qx, qy, qz)
-    else:
-        # Only translation data
-        root_sliders[0].value = float(x)
-        root_sliders[1].value = float(y)
-        root_sliders[2].value = float(z)
-        root_frame.position = (x, y, z)
-
-
-def update_joint_sliders(
-    joint_sliders: list[viser.GuiSliderHandle], joint_values: np.ndarray, slider_state: dict
-) -> None:
-    """Update the joint slider values (avoiding callback conflicts during animation)."""
-
-    # Set flag to prevent callbacks from pausing animation
-    slider_state["updating_from_animation"] = True
-
-    for slider, value in zip(joint_sliders, joint_values):
-        slider.value = float(value)
-
-    # Reset flag
-    slider_state["updating_from_animation"] = False
-
-
 def main(
-    motion_file: Path,
-    output_fps: int | None = None,
+    motion_file: list[Path],
+    robot: Literal["g1", "t2"] | None = None,
+    retargeted_motion_file: Path | None = None,
     urdf_path: Path | None = None,
+    model_path: Path | None = None,
+    terrain_file: Path | None = None,
+    output_fps: int | None = None,
     loop: bool = True,
     load_meshes: bool = True,
     load_collision_meshes: bool = False,
-    terrain_file: Path | None = None,
     show_vel_cmd: bool = False,
 ) -> None:
-    """Animate a URDF with motion data.
+    """View motion with Robot, Stage and Seq selectors in a shared sidebar.
 
     Args:
-        motion_file: Required generated tracking motion (.npz) or directory of generated motions.
-        urdf_path: Optional G1 URDF override (same 29-joint order as the packaged model)
-        loop: Whether to loop the animation
-        load_meshes: Load visual meshes
-        load_collision_meshes: Load collision meshes
-        terrain_file: Optional OBJ mesh to add to the scene as static terrain
-        show_vel_cmd: If True, show velocity command visualization using matplotlib
+        motion_file: One or more NPZ/BIN files or directories (searched recursively).
+        robot: Only include this robot. If omitted, include all detected robots.
+        retargeted_motion_file: Optional second NPZ or directory of retargeted motions.
+        urdf_path: Optional G1 URDF override.
+        model_path: Optional T2 MJCF override.
+        terrain_file: Optional terrain OBJ used when a sequence has no paired terrain.
+        output_fps: Frame rate for saved edits; defaults to the selected motion's FPS.
+        loop: Loop the selected sequence.
+        load_meshes: Load visual meshes.
+        load_collision_meshes: Load collision meshes.
+        show_vel_cmd: Show velocity commands in a matplotlib window.
     """
-    if urdf_path is None:
-        urdf_path = Path(G1_URDF)
-    if not motion_file.exists():
-        raise FileNotFoundError(f"Generated motion not found: {motion_file}")
+    def paired_terrain_files(path: Path) -> list[Path]:
+        stems = dict.fromkeys((path.stem.replace("_motion", "_terrain"), path.stem + "_terrain"))
+        return [path.parent / f"{stem}{suffix}" for stem in stems for suffix in (".npy", ".obj")]
 
-    # Handle directory input
-    motion_files: List[Path] = []
-    is_directory_mode = motion_file.is_dir()
-    if is_directory_mode:
-        print(f"Scanning directory: {motion_file}")
-        found = [path for path in motion_file.glob("*.npz") if not path.stem.endswith("_terrain")]
-        motion_files.extend(found)
-        motion_files.sort()
-        if not motion_files:
-            raise ValueError(f"No supported motion files found in directory: {motion_file}")
-        print(f"Found {len(motion_files)} motion files.")
-        current_motion_file = motion_files[0]
-    else:
-        motion_files = [motion_file]
-        current_motion_file = motion_file
+    def terrain_path(path: Path, range_index: int | None) -> Path | None:
+        if path.suffix == ".bin":
+            config = next((cfg for skill, cfg in SKILL_REGISTRY.items()
+                           if resolve_paths(skill, cfg)[0] == path.name), {})
+            terrains = config.get("terrains", [])
+            if terrains:
+                return path.parent / terrains[range_index]
+            return next((p for p in (
+                path.with_name(f"{path.stem}_range{range_index:02d}_terrain.npy"),
+                path.with_name(f"{path.stem}_range{range_index:02d}_terrain.obj"),
+            ) if p.is_file()), terrain_file)
+        return next((p for p in paired_terrain_files(path) if p.is_file()), terrain_file)
 
-    # Start viser server
+    def has_terrain(path: Path, range_index: int | None) -> bool:
+        terrain = terrain_path(path, range_index)
+        if terrain is None or not terrain.is_file():
+            return False
+        if terrain.suffix == ".npy":
+            return np.load(terrain, allow_pickle=False).size > 0
+        return True
+
+    catalog: dict[str, dict[str, dict[str, tuple[Path, int | None]]]] = {}
+    sources = list(motion_file)
+    if retargeted_motion_file is not None:
+        sources.append(retargeted_motion_file)
+    for source in sources:
+        paths = sorted([*source.rglob("*.npz"), *source.rglob("*.bin")]) if source.is_dir() else [source]
+        for path in paths:
+            name = str(path.relative_to(source)) if source.is_dir() else path.name
+            if path.suffix == ".bin":
+                db = MotionMatchingDatabase()
+                db.load_from_file(str(path))
+                robot_name = "T2" if len(db.bone_parents) == 33 else "G1"
+                stage = "Database"
+                sequences = {
+                    (f"{name} / range {index:02d}"
+                     + ("" if has_terrain(path, index) else " [No terrain]")): (path, index)
+                    for index in range(len(db.range_starts))
+                }
+            else:
+                with np.load(path, allow_pickle=False) as data:
+                    if "joint_pos" in data.files:
+                        robot_name = "T2" if data["joint_pos"].shape[1] == 31 else "G1"
+                        stage = "Motion matching"
+                    elif "qpos" in data.files and data["qpos"].shape[1] in (36, 38):
+                        robot_name = "T2" if data["qpos"].shape[1] == 38 else "G1"
+                        stage = "Retargeted"
+                    else:
+                        continue
+                    has_object = "object_qpos" in data.files and path.with_name(path.stem + "_object.obj").is_file()
+                label = name if has_object or has_terrain(path, None) else name + " [No terrain]"
+                sequences = {label: (path, None)}
+            if robot is None or robot_name.lower() == robot:
+                catalog.setdefault(robot_name, {}).setdefault(stage, {}).update(sequences)
+    if not catalog:
+        raise ValueError("No supported NPZ/BIN motion files found")
+
+    for robot_name, stages in catalog.items():
+        catalog[robot_name] = {
+            stage: stages[stage] for stage in ("Retargeted", "Database", "Motion matching")
+            if stage in stages
+        }
+    initial_robot = next(iter(catalog))
+    initial_stage = next(iter(catalog[initial_robot]))
     server = viser.ViserServer()
-    print("Viser server started. Open http://localhost:8080 in your browser.")
+    root_frame = add_world_scene(server)
 
-    print(f"Loading G1 URDF from {urdf_path}")
-
-    # Create root transform controls
-    root_sliders, root_frame = create_root_transform_controls(server)
-
-    # Create URDF visualizer (attach to root frame)
-    viser_urdf = ViserUrdf(
-        server,
-        urdf_or_path=urdf_path,
-        root_node_name="/robot_root",  # Attach to root frame
-        load_meshes=load_meshes,
-        load_collision_meshes=load_collision_meshes,
-        collision_mesh_color_override=(1.0, 0.0, 0.0, 0.5),
-    )
-
-    urdf_joint_names = viser_urdf.get_actuated_joint_names()
-    urdf_num_joints = len(urdf_joint_names)
-
-    # --- Animation State ---
-    anim_state = {
-        "motion_data": None,
-        "root_data": None,
-        "qpos_data": None,
-        "fps": 30.0,
-        "num_timesteps": 0,
-        "num_joints": 0,
-        "current_frame": 0.0,
-        "current_file": current_motion_file,
-    }
-
-    # --- Terrain State ---
-    terrain_state = {
-        "mesh_handle": None,
-        "format": None,
-        "variant_count": 0,
-        "active_variant": None,
-        "npy_data": None,
-    }
-
-    def load_and_process_motion(file_path: Path) -> None:
-        print(f"\nLoading: {file_path.name}")
-        j_data, r_data, q_data, f_val, v_data = load_motion_data(file_path)
-
-        n_time, n_joints = j_data.shape
-
-        if n_joints != urdf_num_joints:
-            raise ValueError(f"Motion has {n_joints} joints; G1 URDF has {urdf_num_joints} actuated joints")
-
-        anim_state["motion_data"] = j_data
-        anim_state["root_data"] = r_data
-        anim_state["qpos_data"] = q_data
-        anim_state["fps"] = f_val
-        anim_state["num_timesteps"] = n_time
-        anim_state["num_joints"] = n_joints
-        anim_state["current_frame"] = 0.0
-        anim_state["current_file"] = file_path
-        anim_state["vel_cmd_data"] = v_data
-
-        # Reset frame slider max
-        frame_slider.max = max(0, n_time - 1)
-        frame_slider.value = 0
-
-        # Update info display
-        info_file_handle.value = str(file_path.name)
-        info_timesteps_handle.value = str(n_time)
-        info_duration_handle.value = f"{n_time / f_val:.2f}s @ {f_val} FPS"
-        info_vel_cmd_handle.value = "-"
-
-        # Locate generated OBJ/NPY terrain paired with this motion.
-        replaced_stem = file_path.stem.replace("_motion", "_terrain")
-        appended_stem = file_path.stem + "_terrain"
-        candidate_stems = [replaced_stem]
-        if appended_stem not in candidate_stems:
-            candidate_stems.append(appended_stem)
-        terrain_stem = candidate_stems[0]
-        for candidate in candidate_stems:
-            if any((file_path.parent / f"{candidate}{ext}").exists() for ext in (".npy", ".obj")):
-                terrain_stem = candidate
-                break
-
-        terrain_npy_file = file_path.parent / f"{terrain_stem}.npy"
-        terrain_obj_file = file_path.parent / f"{terrain_stem}.obj"
-        if terrain_npy_file.exists():
-            load_terrain_npy(terrain_npy_file)
-        elif terrain_obj_file.exists():
-            load_terrain(terrain_obj_file)
-            _sync_terrain_variant_controls(0)
-        elif terrain_file is not None and terrain_file.exists():
-            # Fallback to global terrain file if provided
-            _sync_terrain_variant_controls(0)  # global terrain loaded once at startup
-        else:
-            # Clear terrain if not found
-            clear_terrain()
-
-    def load_terrain_npy(path: Path) -> None:
-        try:
-            print(f"Loading terrain mesh from {path}")
-            terrain_data = np.load(path)  # Shape: n x m x 10
-            # n: number of boxes
-            # m: number of coherent terrain-scene variants. A single m index
-            #    must be shared by all boxes.
-            # 10: [pos(3), quat(4), size(3)]
-
-            n_boxes, n_variants, n_dims = terrain_data.shape
-            assert n_dims == 10, f"Expected 10 dimensions (pos+quat+size), got {n_dims}"
-
-            print(f"Loaded terrain data: {n_boxes} boxes, {n_variants} scene variants")
-            terrain_state.update(
-                {
-                    "format": "npy",
-                    "variant_count": n_variants,
-                    "active_variant": None,
-                    "npy_data": terrain_data,
-                }
-            )
-            if n_boxes == 0 or n_variants == 0:
-                # Empty terrain is meaningful (for example, obstacle-free
-                # random_locomotion scenes). Remove any mesh left by the
-                # previously selected motion before returning.
-                terrain_state["variant_count"] = 0
-                _sync_terrain_variant_controls(0)
-                _replace_terrain_mesh([], "empty NPY terrain")
-                return
-            _sync_terrain_variant_controls(n_variants)
-            initial_index = int(np.random.randint(0, n_variants))
-            terrain_variant_dropdown.value = str(initial_index)
-            _apply_npy_terrain_variant(initial_index)
-        except Exception as exc:
-            print(f"Failed to load terrain mesh from {path}: {exc}")
-            import traceback
-
-            traceback.print_exc()
-
-    def _replace_terrain_mesh(meshes: list[trimesh.Trimesh], description: str) -> None:
-        if terrain_state["mesh_handle"] is not None:
-            terrain_state["mesh_handle"].remove()
-            terrain_state["mesh_handle"] = None
-        if not meshes:
-            print(f"No terrain geometry for {description}")
-            return
-        terrain_mesh = trimesh.util.concatenate(meshes)
-        terrain_mesh.merge_vertices()
-        terrain_state["mesh_handle"] = server.scene.add_mesh_trimesh(
-            "/terrain_mesh",
-            mesh=terrain_mesh,
-            position=(0.0, 0.0, 0.0),
-            wxyz=(1.0, 0.0, 0.0, 0.0),
+    with server.gui.add_folder("Motion"):
+        robot_select = server.gui.add_dropdown("Robot", options=list(catalog), initial_value=initial_robot)
+        stage_select = server.gui.add_dropdown(
+            "Stage", options=list(catalog[initial_robot]), initial_value=initial_stage,
         )
-        print(f"Loaded {description} with {len(meshes)} mesh(es)")
+        seq_select = server.gui.add_dropdown(
+            "Seq", options=list(catalog[initial_robot][initial_stage]),
+        )
+        autoplay = server.gui.add_checkbox("Autoplay Sequence", initial_value=False)
+        delete = server.gui.add_button("Delete Current File")
+    with server.gui.add_folder("Playback"):
+        play = server.gui.add_checkbox("Play", initial_value=False)
+        restart = server.gui.add_button("Restart")
+        speed = server.gui.add_slider("Speed", min=0.1, max=5.0, step=0.1, initial_value=1.0)
+        frame = server.gui.add_slider("Frame", min=0, max=1, step=1, initial_value=0)
+        save = server.gui.add_button("Save Motion")
 
-    def _apply_npy_terrain_variant(variant_index: int) -> None:
-        terrain_data = terrain_state["npy_data"]
-        if terrain_data is None or terrain_data.shape[1] == 0:
-            return
-        variant_index = int(np.clip(variant_index, 0, terrain_data.shape[1] - 1))
-        if terrain_state["format"] == "npy" and terrain_state["active_variant"] == variant_index:
-            return
-        meshes = [
-            reconstruct_box_mesh(box[0:3], box[7:10], box[3:7])
-            for box in terrain_data[:, variant_index, :]
-        ]
-        _replace_terrain_mesh(meshes, f"NPY terrain variant {variant_index}")
-        terrain_state["active_variant"] = variant_index
+    with server.gui.add_folder("Motion Info"):
+        info_file = server.gui.add_text("File", initial_value="", disabled=True)
+        info_frames = server.gui.add_text("Timesteps", initial_value="", disabled=True)
+        info_joints = server.gui.add_text("Joints", initial_value="", disabled=True)
+        info_duration = server.gui.add_text("Duration", initial_value="", disabled=True)
+        info_fps = server.gui.add_text("FPS", initial_value="", disabled=True)
+        info_command = server.gui.add_text("Velocity Command", initial_value="No Data", disabled=True)
 
-    def load_terrain(path: Path) -> None:
-        try:
-            print(f"Loading terrain mesh from {path}")
-            loaded_mesh = trimesh.load(path, force="mesh")
-            terrain_mesh = trimesh.Trimesh(vertices=loaded_mesh.vertices, faces=loaded_mesh.faces)
-            terrain_mesh.merge_vertices()
+        contact_label = server.gui.add_text("Contact (L/R)", initial_value="No Data", disabled=True)
+        show_contact_markers = server.gui.add_checkbox("Show Contact Markers", initial_value=True)
 
-            # Remove previous terrain if exists
-            if terrain_state["mesh_handle"] is not None:
-                terrain_state["mesh_handle"].remove()
+    contact_markers = [None, None]
+    root_sliders = []
+    with server.gui.add_folder("Root Transform", expand_by_default=False):
+        for label, lower, upper in (
+            ("X Position", -5.0, 5.0), ("Y Position", -5.0, 5.0), ("Z Position", -2.0, 3.0),
+            ("Roll", -np.pi, np.pi), ("Pitch", -np.pi, np.pi), ("Yaw", -np.pi, np.pi),
+        ):
+            root_sliders.append(server.gui.add_slider(label, min=lower, max=upper, step=0.01, initial_value=0.0))
 
-            terrain_state["mesh_handle"] = server.scene.add_mesh_trimesh(
-                "/terrain_mesh", mesh=terrain_mesh, position=(0.0, 0.0, 0.0), wxyz=(1.0, 0.0, 0.0, 0.0)
-            )
-            terrain_state.update(
-                {
-                    "format": "obj",
-                    "variant_count": 0,
-                    "active_variant": None,
-                    "npy_data": None,
-                }
-            )
-            _sync_terrain_variant_controls(0)
-        except Exception as exc:
-            print(f"Failed to load terrain mesh {path}: {exc}")
-            import traceback
+    with server.gui.add_folder("Visibility", expand_by_default=False):
+        show_meshes = server.gui.add_checkbox("Show meshes", initial_value=load_meshes, visible=load_meshes)
+        show_collisions = server.gui.add_checkbox(
+            "Show collision meshes", initial_value=load_collision_meshes, visible=load_collision_meshes,
+        )
 
-            traceback.print_exc()
+    with server.gui.add_folder("Terrain Controls") as terrain_folder:
+        terrain_variant = server.gui.add_dropdown("Variant", options=["0"])
+        rerandomize_terrain = server.gui.add_button("Re-randomize Terrain")
+    terrain_folder.visible = False
+
+    playback_lock = Lock()
+    renderer, spec = None, None
+    state = {"motion": None, "frame": 0.0, "contacts": None, "contact_positions": None}
+    joint_folder = None
+    joint_sliders = []
+    terrain_handle = None
+    terrain_boxes = None
+    object_handle = None
+    object_qpos = None
+
 
     def clear_terrain() -> None:
-        if terrain_state["mesh_handle"] is not None:
-            terrain_state["mesh_handle"].remove()
-            terrain_state["mesh_handle"] = None
-        terrain_state.update(
-            {
-                "format": None,
-                "variant_count": 0,
-                "active_variant": None,
-                "npy_data": None,
-            }
-        )
-        _sync_terrain_variant_controls(0)
+        nonlocal terrain_handle, terrain_boxes, object_handle, object_qpos
+        if object_handle is not None:
+            object_handle.remove()
+            object_handle = None
+        object_qpos = None
+        if terrain_handle is not None:
+            terrain_handle.remove()
+            terrain_handle = None
+        terrain_boxes = None
+        terrain_folder.visible = False
 
-    # --- GUI Setup ---
+    def apply_terrain_variant(index: int) -> None:
+        nonlocal terrain_handle
+        if terrain_handle is not None:
+            terrain_handle.remove()
+        mesh = trimesh.util.concatenate([
+            reconstruct_box_mesh(box[:3], box[7:10], box[3:7]) for box in terrain_boxes[:, index]
+        ])
+        terrain_handle = server.scene.add_mesh_trimesh("/terrain", mesh=mesh)
 
-    # File Selector (if directory)
-    autoplay_checkbox = None
-    file_dropdown = None
-    delete_button = None
-    if is_directory_mode:
-        with server.gui.add_folder("File Selection"):
-            if len(motion_files) > 1:
-                file_options = [p.name for p in motion_files]
-                file_dropdown = server.gui.add_dropdown(
-                    "Motion File", options=file_options, initial_value=current_motion_file.name
-                )
-
-                @file_dropdown.on_update
-                def _(_: Any) -> None:
-                    selected_name = file_dropdown.value
-                    # Find full path
-                    for p in motion_files:
-                        if p.name == selected_name:
-                            load_and_process_motion(p)
-                            break
-            else:
-                # Show current file name as text when only one file
-                server.gui.add_text("Current File", current_motion_file.name)
-
-            autoplay_checkbox = server.gui.add_checkbox("Autoplay Sequence", initial_value=False)
-
-            delete_button = server.gui.add_button("Delete Current File")
-
-            @delete_button.on_click
-            def _(_: Any) -> None:
-                """Delete the current motion file and associated terrain files."""
-                current_file = anim_state["current_file"]
-                if current_file is None or not current_file.exists():
-                    print(f"Cannot delete: file {current_file} does not exist")
-                    return
-
-                try:
-                    # Delete the motion file
-                    print(f"Deleting motion file: {current_file}")
-                    current_file.unlink()
-
-                    # Delete associated terrain files
-                    # Try terrain.obj pattern: {stem}_terrain.obj
-                    terrain_obj = current_file.parent / f"{current_file.stem}_terrain.obj"
-                    if terrain_obj.exists():
-                        print(f"Deleting terrain file: {terrain_obj}")
-                        terrain_obj.unlink()
-
-                    # Try terrain.npy pattern: {stem}.npy (with _motion -> _terrain replacement)
-                    terrain_npy_pattern1 = current_file.parent / f"{current_file.stem}.npy".replace(
-                        "_motion", "_terrain"
-                    )
-                    if terrain_npy_pattern1.exists():
-                        print(f"Deleting terrain file: {terrain_npy_pattern1}")
-                        terrain_npy_pattern1.unlink()
-
-                    # Also try direct {stem}_terrain.npy pattern
-                    terrain_npy_pattern2 = current_file.parent / f"{current_file.stem}_terrain.npy"
-                    if terrain_npy_pattern2.exists():
-                        print(f"Deleting terrain file: {terrain_npy_pattern2}")
-                        terrain_npy_pattern2.unlink()
-
-                    # Remove from motion_files list
-                    motion_files.remove(current_file)
-
-                    # Clear terrain from scene
-                    clear_terrain()
-
-                    # Update dropdown options or UI
-                    if len(motion_files) > 0:
-                        if file_dropdown is not None:
-                            file_options = [p.name for p in motion_files]
-                            file_dropdown.options = file_options
-
-                            # Load next file (or first file if we deleted the last one)
-                            next_file = motion_files[0] if motion_files else None
-                            if next_file:
-                                file_dropdown.value = next_file.name
-                                load_and_process_motion(next_file)
-                        else:
-                            # Only one file left, reload it
-                            next_file = motion_files[0]
-                            load_and_process_motion(next_file)
-                    else:
-                        print("All motion files deleted")
-                        if file_dropdown is not None:
-                            file_dropdown.options = []
-                        anim_state["motion_data"] = None
-                        anim_state["root_data"] = None
-                        anim_state["qpos_data"] = None
-                        anim_state["num_timesteps"] = 0
-                        frame_slider.max = 0
-                        frame_slider.value = 0
-                        info_file_handle.value = "No file loaded"
-                        info_timesteps_handle.value = "-"
-                        info_duration_handle.value = "-"
-
-                    print(f"Successfully deleted {current_file.name}")
-
-                except Exception as e:
-                    print(f"Error deleting file {current_file}: {e}")
-                    import traceback
-
-                    traceback.print_exc()
-
-    # Animation Controls
-    play_button, speed_slider, frame_slider, save_button = create_animation_controls(server)
-
-    # Info Display
-    with server.gui.add_folder("Motion Info"):
-        info_file_handle = server.gui.add_text("File", "Loading...")
-        info_timesteps_handle = server.gui.add_text("Timesteps", "-")
-        server.gui.add_text("Joints", str(urdf_num_joints))
-        info_duration_handle = server.gui.add_text("Duration", "-")
-        info_vel_cmd_handle = server.gui.add_text("Velocity Command", "-")
-
-    # Joint Sliders
-    joint_limits = viser_urdf.get_actuated_joint_limits()
-    joint_sliders, slider_state = create_joint_value_sliders(
-        server=server,
-        joint_names=urdf_joint_names,
-        joint_limits=joint_limits,
-        viser_urdf=viser_urdf,
-        play_button=play_button,
-    )
-
-    # Visibility Controls
-    with server.gui.add_folder("Visibility"):
-        show_meshes_cb = server.gui.add_checkbox("Show meshes", viser_urdf.show_visual)
-        show_collision_meshes_cb = server.gui.add_checkbox("Show collision meshes", viser_urdf.show_collision)
-
-    @show_meshes_cb.on_update
-    def _(_: Any) -> None:
-        viser_urdf.show_visual = show_meshes_cb.value
-
-    @show_collision_meshes_cb.on_update
-    def _(_: Any) -> None:
-        viser_urdf.show_collision = show_collision_meshes_cb.value
-
-    show_meshes_cb.visible = load_meshes
-    show_collision_meshes_cb.visible = load_collision_meshes
-
-    # Terrain variant controls, ported from tracking_motion_animator.py.
-    with server.gui.add_folder("Terrain Controls"):
-        terrain_variant_dropdown = server.gui.add_dropdown(
-            "Variant",
-            options=["0"],
-            initial_value="0",
-        )
-        terrain_variant_dropdown.visible = False
-        rerandomize_terrain_button = server.gui.add_button("Re-randomize Terrain")
-        rerandomize_terrain_button.visible = False
-
-    def _sync_terrain_variant_controls(num_variants: int) -> None:
-        options = [str(index) for index in range(max(1, num_variants))]
-        terrain_variant_dropdown.options = options
-        terrain_variant_dropdown.value = options[0]
-        terrain_variant_dropdown.visible = num_variants > 0
-        rerandomize_terrain_button.visible = num_variants > 1
-
-    def _apply_active_terrain_variant(variant_index: int) -> None:
-        if terrain_state["format"] == "npy":
-            _apply_npy_terrain_variant(variant_index)
-
-    @terrain_variant_dropdown.on_update
-    def _(_: Any) -> None:
-        try:
-            variant_index = int(terrain_variant_dropdown.value)
-        except ValueError:
+    def load_terrain(path: Path, range_index: int | None) -> None:
+        nonlocal terrain_handle, terrain_boxes, object_handle, object_qpos
+        clear_terrain()
+        if path.suffix == ".npz":
+            with np.load(path, allow_pickle=False) as data:
+                if "object_qpos" in data:
+                    object_qpos = data["object_qpos"]
+                    mesh = trimesh.load(path.with_name(path.stem + "_object.obj"), force="mesh")
+                    object_handle = server.scene.add_mesh_trimesh("/tracked_object", mesh=mesh)
+        terrain = terrain_path(path, range_index)
+        if terrain is None:
             return
-        _apply_active_terrain_variant(variant_index)
-
-    @rerandomize_terrain_button.on_click
-    def _(_: Any) -> None:
-        num_variants = int(terrain_state["variant_count"])
-        if num_variants <= 0:
-            return
-        if num_variants == 1:
-            variant_index = 0
+        if terrain.suffix == ".npy":
+            terrain_boxes = np.load(terrain, allow_pickle=False)
+            if not terrain_boxes.shape[0] or not terrain_boxes.shape[1]:
+                return
+            terrain_folder.visible = True
+            variants = terrain_boxes.shape[1]
+            terrain_variant.options = [str(index) for index in range(variants)]
+            initial = int(np.random.randint(variants))
+            terrain_variant.value = str(initial)
+            rerandomize_terrain.visible = variants > 1
+            apply_terrain_variant(initial)
         else:
-            current_index = int(terrain_variant_dropdown.value)
-            variant_index = (current_index + int(np.random.randint(1, num_variants))) % num_variants
-        terrain_variant_dropdown.value = str(variant_index)
-        _apply_active_terrain_variant(variant_index)
+            mesh = trimesh.load(terrain, force="mesh")
+            terrain_handle = server.scene.add_mesh_trimesh("/terrain", mesh=mesh)
 
-    # Grid
-    server.scene.add_grid("/grid", width=200, height=200)
+    def draw_pose(index: int) -> None:
+        joints, roots, _, _, _ = state["motion"]
+        with server.atomic():
+            renderer.update_cfg(joints[index])
+            root_frame.position = roots[index, :3]
+            root_frame.wxyz = roots[index, 3:7]
+            if object_handle is not None:
+                object_handle.position = object_qpos[index, :3]
+                object_handle.wxyz = object_qpos[index, 3:7]
+            for slider, value in zip(joint_sliders, joints[index]):
+                slider.value = float(value)
+            euler = Rotation.from_quat(roots[index, [4, 5, 6, 3]]).as_euler("xyz")
+            for slider, value in zip(root_sliders, np.concatenate((roots[index, :3], euler))):
+                slider.value = float(value)
+            contacts = state["contacts"]
+            contact_label.value = (
+                f"L: {int(contacts[index, 0])}  R: {int(contacts[index, 1])}"
+                if contacts is not None else "No Data"
+            )
+            for side, name in enumerate(("left", "right")):
+                visible = contacts is not None and show_contact_markers.value and bool(contacts[index, side])
+                if visible:
+                    # Same marker geometry and styling as play_database.py/run.py.
+                    contact_markers[side] = server.scene.add_icosphere(
+                        f"/contact_marker/{name}", position=state["contact_positions"][index, side],
+                        radius=0.06, color=np.array([0, 100, 255]), subdivisions=2,
+                    )
+                elif contact_markers[side] is not None:
+                    contact_markers[side].remove()
+                    contact_markers[side] = None
+            commands = state["motion"][4]
+            info_command.value = (
+                VEL_CMD_MAPPING.get(int(np.argmax(commands[index])), "Undefined")
+                if commands is not None else "No Data"
+            )
 
-    # --- Initial Load ---
+    def select_seq() -> None:
+        play.value = False
+        path, range_index = catalog[robot_select.value][stage_select.value][seq_select.value]
+        motion = load_motion_data(path, robot_spec=spec, range_index=range_index)
+        state.update(motion=motion, frame=0.0, contacts=None, contact_positions=None)
+        if path.suffix == ".bin":
+            db = MotionMatchingDatabase()
+            db.load_from_file(str(path))
+            start, stop = db.range_starts[range_index], db.range_stops[range_index]
+            _, positions = quat.fk(db.bone_rotations[start:stop], db.bone_positions[start:stop], db.bone_parents)
+            feet = [spec.bone_left_foot, spec.bone_right_foot] if spec is not None else [G1_BONE_LEFT_FOOT, G1_BONE_RIGHT_FOOT]
+            state.update(contacts=db.contact_states[start:stop], contact_positions=positions[:, feet])
+        show_contact_markers.disabled = state["contacts"] is None
+        frame.max = len(motion[0]) - 1
+        frame.value = 0
+        for index, slider in enumerate(root_sliders[:3]):
+            default_lower, default_upper = (-2.0, 3.0) if index == 2 else (-5.0, 5.0)
+            slider.min = min(default_lower, float(motion[1][:, index].min()) - 1.0)
+            slider.max = max(default_upper, float(motion[1][:, index].max()) + 1.0)
+        info_file.value = path.name if range_index is None else f"{path.name} / range {range_index:02d}"
+        info_frames.value = str(len(motion[0]))
+        info_joints.value = str(motion[0].shape[1])
+        info_duration.value = f"{len(motion[0]) / motion[3]:.2f} s"
+        info_fps.value = f"{motion[3]:g}"
+        load_terrain(path, range_index)
+        draw_pose(0)
+        print(f"Loaded {path}: {len(motion[0])} frames @ {motion[3]:g} FPS")
 
-    # Load global terrain first if provided
-    if terrain_file is not None and terrain_file.exists():
-        load_terrain(terrain_file)
+    def select_stage() -> None:
+        paths = catalog[robot_select.value][stage_select.value]
+        seq_select.options = list(paths)
+        seq_select.value = next(iter(paths))
+        select_seq()
 
-    load_and_process_motion(current_motion_file)
+    def select_robot() -> None:
+        nonlocal renderer, spec, joint_folder, joint_sliders
+        play.value = False
+        if renderer is not None:
+            renderer.remove()
+        if joint_folder is not None:
+            joint_folder.remove()
+        spec = get_robot_spec("t2", model_path=model_path) if robot_select.value == "T2" else None
+        if spec is not None:
+            from motion_matching.viz.mujoco import ViserMujoco
 
-    # --- Save Handler ---
-    @save_button.on_click
-    def _(_: Any) -> None:
-        if anim_state["qpos_data"] is None:
-            print("Cannot save: no motion data loaded")
+            renderer = ViserMujoco(
+                server, spec, load_meshes=load_meshes, load_collision_meshes=load_collision_meshes,
+            )
+        else:
+            renderer = ViserUrdf(
+                server, urdf_or_path=urdf_path or Path(G1_URDF), root_node_name="/robot_root",
+                load_meshes=load_meshes, load_collision_meshes=load_collision_meshes,
+                collision_mesh_color_override=(1.0, 0.0, 0.0, 0.5),
+            )
+        renderer.show_visual = show_meshes.value
+        renderer.show_collision = show_collisions.value
+        joint_sliders = []
+        joint_folder = server.gui.add_folder("Joint Values (DOF)", expand_by_default=False)
+        limits = renderer.get_actuated_joint_limits()
+        with joint_folder:
+            for name in renderer.get_actuated_joint_names():
+                lower, upper = limits[name]
+                lower = -np.pi if lower is None else lower
+                upper = np.pi if upper is None else upper
+                slider = server.gui.add_slider(
+                    name, min=lower, max=upper, step=0.001, initial_value=float(np.clip(0.0, lower, upper)),
+                )
+                slider.on_update(edit_joints)
+                joint_sliders.append(slider)
+        stage_select.options = list(catalog[robot_select.value])
+        stage_select.value = stage_select.options[0]
+        select_stage()
+
+    def edit_joints(event) -> None:
+        if event.client_id is None:
             return
+        with playback_lock:
+            play.value = False
+            index = int(frame.value)
+            joints, _, qpos, _, _ = state["motion"]
+            joints[index] = [slider.value for slider in joint_sliders]
+            qpos[index, 7:] = joints[index]
+            draw_pose(index)
 
-        speed_value = float(speed_slider.value)
-        speed_suffix = f"{speed_value:.2f}".rstrip("0").rstrip(".").replace(".", "p")
-        if not speed_suffix:
-            speed_suffix = "1"
+    def edit_root(event) -> None:
+        if event.client_id is None:
+            return
+        with playback_lock:
+            play.value = False
+            index = int(frame.value)
+            _, roots, qpos, _, _ = state["motion"]
+            values = np.array([slider.value for slider in root_sliders])
+            rotation = Rotation.from_euler("xyz", values[3:]).as_quat()[[3, 0, 1, 2]]
+            roots[index] = np.concatenate((values[:3], rotation))
+            qpos[index, :4], qpos[index, 4:7] = rotation, values[:3]
+            draw_pose(index)
 
-        curr_file = anim_state["current_file"]
-        output_filename = f"{curr_file.stem}_speed_{speed_suffix}.npz"
-        output_path = curr_file.parent / output_filename
+    for slider in root_sliders:
+        slider.on_update(edit_root)
 
-        saved_fps = output_fps if output_fps is not None else anim_state["fps"]
-        save_edited_motion_npz(
-            anim_state["qpos_data"],
-            output_path,
-            source_fps=anim_state["fps"],
-            target_fps=saved_fps,
-            speed=speed_value,
-            vel_cmd=anim_state["vel_cmd_data"],
-        )
-        print(f"Motion saved to {output_path} (speed={speed_value:.2f}, fps={saved_fps})")
+    @frame.on_update
+    def _(event) -> None:
+        if event.client_id is not None:
+            with playback_lock:
+                play.value = False
+                state["frame"] = float(frame.value)
+                draw_pose(int(state["frame"]))
 
-    # --- Animation Loop ---
-    print("Starting animation loop...")
+    @show_contact_markers.on_update
+    def update_contact_markers(_) -> None:
+        with playback_lock:
+            draw_pose(int(frame.value))
 
-    # Setup matplotlib for vel_cmd visualization
-    fig_vel, ax_vel = None, None
-    vel_bars = None
+    @show_meshes.on_update
+    def _(event) -> None:
+        if event.client_id is not None:
+            with playback_lock:
+                renderer.show_visual = show_meshes.value
+
+    @show_collisions.on_update
+    def _(event) -> None:
+        if event.client_id is not None:
+            with playback_lock:
+                renderer.show_collision = show_collisions.value
+
+    @terrain_variant.on_update
+    def _(event) -> None:
+        if event.client_id is not None:
+            with playback_lock:
+                apply_terrain_variant(int(terrain_variant.value))
+
+    @rerandomize_terrain.on_click
+    def _(_event) -> None:
+        with playback_lock:
+            current, count = int(terrain_variant.value), terrain_boxes.shape[1]
+            index = (current + int(np.random.randint(1, count))) % count
+            terrain_variant.value = str(index)
+            apply_terrain_variant(index)
+
+    @robot_select.on_update
+    def _(event) -> None:
+        if event.client_id is not None:
+            with playback_lock:
+                select_robot()
+
+    @stage_select.on_update
+    def _(event) -> None:
+        if event.client_id is not None:
+            with playback_lock:
+                select_stage()
+
+    @seq_select.on_update
+    def _(event) -> None:
+        if event.client_id is not None:
+            with playback_lock:
+                select_seq()
+
+    select_robot()
+
+    @restart.on_click
+    def _(_event) -> None:
+        with playback_lock:
+            state["frame"] = 0.0
+            frame.value = 0
+            draw_pose(0)
+            play.value = True
+
+    @save.on_click
+    def _(_event) -> None:
+        with playback_lock:
+            path, range_index = catalog[robot_select.value][stage_select.value][seq_select.value]
+            _, _, qpos, fps, commands = state["motion"]
+            speed_value = float(speed.value)
+            speed_suffix = f"{speed_value:.2f}".rstrip("0").rstrip(".").replace(".", "p")
+            stem = path.stem if range_index is None else f"{path.stem}_range_{range_index:02d}"
+            output_path = path.with_name(f"{stem}_speed_{speed_suffix}.npz")
+            saved_fps = output_fps if output_fps is not None else fps
+            tracking = save_edited_motion_npz(
+                qpos, output_path, source_fps=fps, target_fps=saved_fps,
+                speed=speed_value, vel_cmd=commands, robot_spec=spec,
+            )
+            if object_qpos is not None:
+                source_times = np.arange(len(object_qpos))
+                sample_times = np.linspace(0, len(object_qpos) - 1, len(tracking["joint_pos"]))
+                positions = np.column_stack([
+                    np.interp(sample_times, source_times, object_qpos[:, axis]) for axis in range(3)
+                ])
+                rotations = Slerp(source_times, Rotation.from_quat(
+                    object_qpos[:, 3:7], scalar_first=True))(sample_times).as_quat(scalar_first=True)
+                tracking["object_qpos"] = np.concatenate((positions, rotations), axis=1)
+                np.savez(output_path, **tracking)
+                shutil.copyfile(path.with_name(path.stem + "_object.obj"),
+                                output_path.with_name(output_path.stem + "_object.obj"))
+            print(f"Motion saved to {output_path} (speed={speed_value:.2f}, fps={saved_fps})")
+
+    @delete.on_click
+    def _(_event) -> None:
+        with playback_lock:
+            play.value = False
+            robot_name, stage = robot_select.value, stage_select.value
+            paths = catalog[robot_name][stage]
+            current_index = list(paths).index(seq_select.value)
+            path, _ = paths[seq_select.value]
+            path.unlink()
+            if path.suffix == ".npz":
+                path.with_name(path.stem + "_object.obj").unlink(missing_ok=True)
+                for terrain in paired_terrain_files(path):
+                    if terrain.exists() or terrain.is_symlink():
+                        terrain.unlink()
+            for stages in catalog.values():
+                for sequences in stages.values():
+                    for name in [name for name, (source, _) in sequences.items() if source == path]:
+                        del sequences[name]
+                for empty_stage in [name for name, sequences in stages.items() if not sequences]:
+                    del stages[empty_stage]
+            for empty_robot in [name for name, stages in catalog.items() if not stages]:
+                del catalog[empty_robot]
+            print(f"Deleted {path}")
+            if not catalog:
+                state["motion"] = None
+                clear_terrain()
+                renderer.remove()
+                joint_folder.remove()
+                for control in (robot_select, stage_select, seq_select, play, restart, frame, save, delete, *root_sliders):
+                    control.disabled = True
+                info_file.value = "No file loaded"
+                for info in (info_frames, info_joints, info_duration, info_fps):
+                    info.value = "-"
+                info_command.value = "No Data"
+            elif robot_name not in catalog:
+                robot_select.options = list(catalog)
+                robot_select.value = robot_select.options[0]
+                select_robot()
+            else:
+                stage_select.options = list(catalog[robot_name])
+                stage_select.value = stage if stage in catalog[robot_name] else stage_select.options[0]
+                seq_select.options = list(catalog[robot_name][stage_select.value])
+                seq_select.value = seq_select.options[min(current_index, len(seq_select.options) - 1)]
+                select_seq()
+
+    fig_vel, ax_vel, vel_bars = None, None, None
     if show_vel_cmd:
         import matplotlib.pyplot as plt
 
         plt.ion()
         fig_vel, ax_vel = plt.subplots(figsize=(10, 4))
-        ax_vel.set_title("Velocity Command (One-Hot)")
-        ax_vel.set_xlabel("Command Index")
-        ax_vel.set_ylabel("Activation")
-        ax_vel.set_ylim(0, 1.1)
-
-    frame_time = 1.0 / 30.0  # Initial safe default
-    next_time = time.perf_counter() + frame_time
 
     while True:
-        # Update fps based on current loaded motion
-        current_fps = anim_state["fps"]
-        if current_fps <= 0:
-            current_fps = 30.0
-        frame_time = 1.0 / current_fps
-
-        num_timesteps = anim_state["num_timesteps"]
-
-        if num_timesteps > 0:
-            if play_button.value:
-                frame_increment = speed_slider.value
-                anim_state["current_frame"] += frame_increment
-
-                if anim_state["current_frame"] >= num_timesteps:
-                    # Handle autoplay sequence
-                    should_advance = False
-                    if autoplay_checkbox is not None and autoplay_checkbox.value:
-                        try:
-                            # Find current file index
-                            current_idx = -1
-                            for i, f in enumerate(motion_files):
-                                if f.name == anim_state["current_file"].name:
-                                    current_idx = i
-                                    break
-
-                            if current_idx != -1:
-                                next_idx = current_idx + 1
-
-                                if next_idx < len(motion_files):
-                                    # Advance to next file
-                                    next_file = motion_files[next_idx]
-                                    if file_dropdown is not None:
-                                        file_dropdown.value = next_file.name
-                                    load_and_process_motion(next_file)
-                                    should_advance = True
-                                elif loop:
-                                    # Loop back to start of playlist
-                                    next_file = motion_files[0]
-                                    if file_dropdown is not None:
-                                        file_dropdown.value = next_file.name
-                                    load_and_process_motion(next_file)
-                                    should_advance = True
-                        except Exception as e:
-                            print(f"Error in autoplay: {e}")
-
-                    if should_advance:
-                        # Frame reset is handled by load_and_process_motion
-                        pass
-                    elif loop:
-                        anim_state["current_frame"] %= num_timesteps
-                    else:
-                        anim_state["current_frame"] = num_timesteps - 1
-                        play_button.value = False
-
-                frame_slider.value = int(anim_state["current_frame"])
+        start = time.perf_counter()
+        command = None
+        with playback_lock:
+            fps = 30.0
+            if state["motion"] is not None:
+                count, fps = len(state["motion"][0]), state["motion"][3]
+                if play.value:
+                    state["frame"] += speed.value
+                    if state["frame"] >= count:
+                        options = list(catalog[robot_select.value][stage_select.value])
+                        next_index = options.index(seq_select.value) + 1
+                        if autoplay.value and (next_index < len(options) or loop):
+                            seq_select.value = options[next_index % len(options)]
+                            select_seq()
+                            play.value = True
+                        elif loop:
+                            state["frame"] %= count
+                        else:
+                            state["frame"] = count - 1
+                            play.value = False
+                    frame.value = int(state["frame"])
+                    draw_pose(int(state["frame"]))
+                else:
+                    state["frame"] = float(frame.value)
+                index = int(state["frame"])
+                commands = state["motion"][4]
+                if commands is not None:
+                    command = commands[index].copy()
+        if show_vel_cmd and plt.fignum_exists(fig_vel.number):
+            if command is None:
+                if vel_bars is not None:
+                    for bar in vel_bars:
+                        bar.set_height(0.0)
+            elif vel_bars is None or len(vel_bars) != len(command):
+                ax_vel.clear()
+                ax_vel.set_title("Velocity Command (One-Hot)")
+                ax_vel.set_xlabel("Command Index")
+                ax_vel.set_ylabel("Activation")
+                ax_vel.set_ylim(0, 1.1)
+                vel_bars = ax_vel.bar(range(len(command)), command)
+                ax_vel.set_xticks(range(len(command)))
+                ax_vel.set_xticklabels(
+                    [f"{i}:{VEL_CMD_MAPPING.get(i, str(i))}" for i in range(len(command))],
+                    rotation=45, ha="right",
+                )
+                fig_vel.tight_layout()
             else:
-                anim_state["current_frame"] = float(frame_slider.value)
-
-            frame_idx = int(anim_state["current_frame"]) % num_timesteps
-
-            if anim_state.get("vel_cmd_data") is not None:
-                vel_cmd = anim_state["vel_cmd_data"][frame_idx]
-                cmd_idx = int(np.argmax(vel_cmd))
-                cmd_str = VEL_CMD_MAPPING.get(cmd_idx, f"Undefined ({cmd_idx})")
-                info_vel_cmd_handle.value = cmd_str
-                # print(f"Frame {frame_idx} vel_cmd: {cmd_str} (idx: {cmd_idx})")
-
-                # Update matplotlib plot
-                if show_vel_cmd and fig_vel is not None and plt.fignum_exists(fig_vel.number):
-                    dim = len(vel_cmd)
-                    if vel_bars is None or len(vel_bars) != dim:
-                        ax_vel.clear()
-                        ax_vel.set_title("Velocity Command (One-Hot)")
-                        ax_vel.set_xlabel("Command Index")
-                        ax_vel.set_ylabel("Activation")
-                        ax_vel.set_ylim(0, 1.1)
-
-                        labels = []
-                        for i in range(dim):
-                            if i in VEL_CMD_MAPPING:
-                                labels.append(f"{i}:{VEL_CMD_MAPPING[i]}")
-                            else:
-                                labels.append(str(i))
-
-                        vel_bars = ax_vel.bar(range(dim), vel_cmd, color=plt.cm.tab20(range(dim)))
-                        ax_vel.set_xticks(range(dim))
-                        ax_vel.set_xticklabels(labels, rotation=45, ha="right")
-                        plt.tight_layout()
-                    else:
-                        for bar, h in zip(vel_bars, vel_cmd):
-                            bar.set_height(h)
-
-                    fig_vel.canvas.draw_idle()
-                    fig_vel.canvas.flush_events()
-            else:
-                info_vel_cmd_handle.value = "No Data"
-
-            # Update pose
-            with server.atomic():
-                if anim_state["motion_data"] is not None:
-                    current_joint_values = anim_state["motion_data"][frame_idx]
-                    viser_urdf.update_cfg(current_joint_values)
-                    update_joint_sliders(
-                        joint_sliders=joint_sliders, joint_values=current_joint_values, slider_state=slider_state
-                    )
-
-                if anim_state["root_data"] is not None:
-                    update_root_transform_from_data(
-                        root_sliders=root_sliders,
-                        root_frame=root_frame,
-                        root_data=anim_state["root_data"],
-                        frame_idx=frame_idx,
-                    )
-            server.flush()
-
-        # Sleep
-        now = time.perf_counter()
-        time_to_sleep = next_time - now
-        if time_to_sleep > 0:
-            time.sleep(time_to_sleep)
-
-        # drift correction
-        if now > next_time + frame_time:
-            next_time = now + frame_time
-        else:
-            next_time += frame_time
+                for bar, value in zip(vel_bars, command):
+                    bar.set_height(value)
+            fig_vel.canvas.draw_idle()
+            fig_vel.canvas.flush_events()
+        time.sleep(max(0.0, 1.0 / fps - (time.perf_counter() - start)))
 
 
 if __name__ == "__main__":

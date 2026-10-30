@@ -1,11 +1,140 @@
 diff --git a/src/holosoma_retargeting/holosoma_retargeting/config_types/data_type.py b/src/holosoma_retargeting/holosoma_retargeting/config_types/data_type.py
-index 7476404..3a3e6a5 100644
+index 7476404..89421cc 100644
 --- a/src/holosoma_retargeting/holosoma_retargeting/config_types/data_type.py
 +++ b/src/holosoma_retargeting/holosoma_retargeting/config_types/data_type.py
-@@ -175,6 +175,24 @@ SMPLX_DEMO_JOINTS = [
+@@ -173,8 +173,153 @@ SMPLX_DEMO_JOINTS = [
+     "R_Wrist",
+ ]
  
++# CMU names identify ASF bone endpoints (e.g. femur endpoint is the knee).
++CMU_DEMO_JOINTS = [
++    "root", "upperback", "lhipjoint", "rhipjoint", "lfemur", "rfemur",
++    "lclavicle", "rclavicle", "lhumerus", "rhumerus", "lradius", "rradius",
++    "ltibia", "rtibia", "ltoes", "rtoes",
++]
++
++NUS_DEMO_JOINTS = [
++    "Hips", "LeftUpLeg", "LeftLeg", "LeftFoot", "LeftToeBase",
++    "RightUpLeg", "RightLeg", "RightFoot", "RightToeBase",
++    "Spine", "Spine1", "Neck", "Head",
++    "LeftShoulder", "LeftArm", "LeftForeArm", "LeftHand",
++    "LeftHandThumb", "L_Wrist_End", "RightShoulder", "RightArm",
++    "RightForeArm", "RightHand", "RightHandThumb", "R_Wrist_End",
++]
++
++PARC_DEMO_JOINTS = [
++    "pelvis",
++    "torso",
++    "head",
++    "right_upper_arm",
++    "right_lower_arm",
++    "right_hand",
++    "left_upper_arm",
++    "left_lower_arm",
++    "left_hand",
++    "right_thigh",
++    "right_shin",
++    "right_foot",
++    "left_thigh",
++    "left_shin",
++    "left_foot",
++    "left_toe",
++    "right_toe",
++]
++
++HOLD_DEMO_JOINTS = [
++    "Hips",
++    "Spine1",
++    "LeftUpLeg",
++    "RightUpLeg",
++    "LeftLeg",
++    "RightLeg",
++    "LeftArm",
++    "RightArm",
++    "LeftForeArm",
++    "RightForeArm",
++    "LeftHand",
++    "RightHand",
++    "LeftFoot",
++    "RightFoot",
++    "LeftSoleToe_Estimated",
++    "RightSoleToe_Estimated",
++]
++
  # Joint mappings - organized by (data_format, robot_type)
  JOINTS_MAPPINGS = {
++    ("hold", "t2"): {
++        "Spine1": "trunk_center_link",
++        "Hips": "waist_link",
++        "LeftUpLeg": "left_hip_pitch_link",
++        "LeftLeg": "left_knee_pitch_link",
++        "LeftArm": "left_shoulder_roll_link",
++        "LeftForeArm": "left_elbow_yaw_link",
++        "LeftHand": "left_wrist_roll_link",
++        "LeftFoot": "left_ankle_pitch_link",
++        "LeftSoleToe_Estimated": "left_foot_sphere_5_link",
++        "RightUpLeg": "right_hip_pitch_link",
++        "RightLeg": "right_knee_pitch_link",
++        "RightArm": "right_shoulder_roll_link",
++        "RightForeArm": "right_elbow_yaw_link",
++        "RightHand": "right_wrist_roll_link",
++        "RightFoot": "right_ankle_pitch_link",
++        "RightSoleToe_Estimated": "right_foot_sphere_5_link",
++    },
++    ("parc", "t2"): {
++        "torso": "trunk_center_link",
++        "pelvis": "waist_link",
++        "left_upper_arm": "left_shoulder_roll_link",
++        "left_lower_arm": "left_elbow_yaw_link",
++        "left_hand": "left_wrist_roll_link",
++        "left_thigh": "left_hip_pitch_link",
++        "left_shin": "left_knee_pitch_link",
++        "left_foot": "left_ankle_pitch_link",
++        "left_toe": "left_foot_sphere_5_link",
++        "right_upper_arm": "right_shoulder_roll_link",
++        "right_lower_arm": "right_elbow_yaw_link",
++        "right_hand": "right_wrist_roll_link",
++        "right_thigh": "right_hip_pitch_link",
++        "right_shin": "right_knee_pitch_link",
++        "right_foot": "right_ankle_pitch_link",
++        "right_toe": "right_foot_sphere_5_link",
++    },
++    ("cmu", "t2"): {
++        "root": "waist_link",
++        "upperback": "trunk_center_link",
++        "lhipjoint": "left_hip_pitch_link",
++        "rhipjoint": "right_hip_pitch_link",
++        "lfemur": "left_knee_pitch_link",
++        "rfemur": "right_knee_pitch_link",
++        "lclavicle": "left_shoulder_roll_link",
++        "rclavicle": "right_shoulder_roll_link",
++        "lhumerus": "left_elbow_yaw_link",
++        "rhumerus": "right_elbow_yaw_link",
++        "lradius": "left_wrist_roll_link",
++        "rradius": "right_wrist_roll_link",
++        "ltibia": "left_ankle_pitch_link",
++        "rtibia": "right_ankle_pitch_link",
++        "ltoes": "left_foot_sphere_5_link",
++        "rtoes": "right_foot_sphere_5_link",
++    },
++    ("nus", "t2"): {
++        "Spine1": "trunk_center_link",
++        "Hips": "waist_link",
++        "LeftUpLeg": "left_hip_pitch_link",
++        "RightUpLeg": "right_hip_pitch_link",
++        "LeftLeg": "left_knee_pitch_link",
++        "RightLeg": "right_knee_pitch_link",
++        "LeftArm": "left_shoulder_roll_link",
++        "RightArm": "right_shoulder_roll_link",
++        "LeftForeArm": "left_elbow_yaw_link",
++        "RightForeArm": "right_elbow_yaw_link",
++        "LeftHand": "left_wrist_roll_link",
++        "RightHand": "right_wrist_roll_link",
++        "LeftFoot": "left_ankle_pitch_link",
++        "RightFoot": "right_ankle_pitch_link",
++        "LeftToeBase": "left_foot_sphere_5_link",
++        "RightToeBase": "right_foot_sphere_5_link",
++    },
 +    ("lafan", "t2"): {
 +        'Spine2': 'trunk_center_link',
 +        'Hips': 'waist_link',
@@ -27,6 +156,53 @@ index 7476404..3a3e6a5 100644
      ("lafan", "g1"): {
          "Spine1": "pelvis_contour_link",
          "LeftUpLeg": "left_hip_pitch_link",
+@@ -243,6 +388,24 @@ JOINTS_MAPPINGS = {
+         "L_Wrist": "left_hand_sphere_link",
+         "R_Wrist": "right_hand_sphere_link",
+     },
++    ("smplx", "t2"): {
++        "Pelvis": "waist_link",
++        "Spine3": "trunk_center_link",
++        "L_Hip": "left_hip_pitch_link",
++        "R_Hip": "right_hip_pitch_link",
++        "L_Knee": "left_knee_pitch_link",
++        "R_Knee": "right_knee_pitch_link",
++        "L_Shoulder": "left_shoulder_roll_link",
++        "R_Shoulder": "right_shoulder_roll_link",
++        "L_Elbow": "left_elbow_yaw_link",
++        "R_Elbow": "right_elbow_yaw_link",
++        "L_Wrist": "left_wrist_roll_link",
++        "R_Wrist": "right_wrist_roll_link",
++        "L_Ankle": "left_ankle_pitch_link",
++        "R_Ankle": "right_ankle_pitch_link",
++        "L_Foot": "left_foot_sphere_5_link",
++        "R_Foot": "right_foot_sphere_5_link",
++    },
+     ("smplx", "g1"): {
+         "Pelvis": "pelvis_contour_link",
+         "L_Hip": "left_hip_pitch_link",
+@@ -298,6 +461,10 @@ JOINTS_MAPPINGS = {
+ 
+ # Data format specific constants
+ TOE_NAMES_BY_FORMAT = {
++    "hold": ["LeftSoleToe_Estimated", "RightSoleToe_Estimated"],
++    "parc": ["left_toe", "right_toe"],
++    "cmu": ["ltoes", "rtoes"],
++    "nus": ["LeftToeBase", "RightToeBase"],
+     "lafan": ["LeftToeBase", "RightToeBase"],
+     "smplh": ["L_Toe", "R_Toe"],
+     "mocap": ["LeftToeBase", "RightToeBase"],
+@@ -324,6 +491,10 @@ DATA_FORMAT_CONSTANTS: dict[str, FormatConstants] = {
+ # This is the SINGLE PLACE to add new formats - just add an entry here!
+ # No need to update any Literal types - DataFormat is now str with runtime validation
+ DEMO_JOINTS_REGISTRY: dict[str, list[str]] = {
++    "hold": HOLD_DEMO_JOINTS,
++    "parc": PARC_DEMO_JOINTS,
++    "cmu": CMU_DEMO_JOINTS,
++    "nus": NUS_DEMO_JOINTS,
+     "lafan": LAFAN_DEMO_JOINTS,
+     "smplh": SMPLH_DEMO_JOINTS,
+     "mocap": MOCAP_DEMO_JOINTS,
 diff --git a/src/holosoma_retargeting/holosoma_retargeting/config_types/robot.py b/src/holosoma_retargeting/holosoma_retargeting/config_types/robot.py
 index e4c1393..dc0820c 100644
 --- a/src/holosoma_retargeting/holosoma_retargeting/config_types/robot.py
@@ -48,6 +224,105 @@ index e4c1393..dc0820c 100644
              return [
                  "left_foot_sphere_1_link",
                  "right_foot_sphere_1_link",
+diff --git a/src/holosoma_retargeting/holosoma_retargeting/examples/robot_retarget.py b/src/holosoma_retargeting/holosoma_retargeting/examples/robot_retarget.py
+index a9eb3ec..e3e7f6c 100644
+--- a/src/holosoma_retargeting/holosoma_retargeting/examples/robot_retarget.py
++++ b/src/holosoma_retargeting/holosoma_retargeting/examples/robot_retarget.py
+@@ -150,8 +150,8 @@ def validate_config(cfg: RetargetingConfig) -> None:
+         )
+ 
+     # Task-specific format requirements
+-    if cfg.task_type == "climbing" and cfg.data_format not in (None, "mocap"):
+-        raise ValueError("Climbing task requires 'mocap' data format")
++    if cfg.task_type == "climbing" and cfg.data_format not in (None, "mocap", "parc", "hold"):
++        raise ValueError("Climbing task requires 'mocap', 'parc' or 'hold' data format")
+     if cfg.task_type == "object_interaction" and cfg.data_format not in (None, "smplh"):
+         raise ValueError("Object interaction requires 'smplh' data format")
+     # robot_only accepts any format in the registry (already validated above)
+@@ -211,7 +211,7 @@ def load_motion_data(
+ 
+             human_joints = np.load(str(npy_path))
+             human_joints = transform_y_up_to_z_up(human_joints)
+-            spine_joint_idx = constants.DEMO_JOINTS.index("Spine1")
++            spine_joint_idx = constants.DEMO_JOINTS.index("upperback" if data_format == "cmu" else "Spine1")
+             # LAFAN-specific spine adjustment
+             human_joints[:, spine_joint_idx, -1] -= 0.06
+             smpl_scale = motion_data_config.default_scale_factor or 1.0
+@@ -249,6 +249,9 @@ def load_motion_data(
+             human_height = human_data["height"]
+             smpl_scale = constants.ROBOT_HEIGHT / human_height
+ 
++            if data_format in ("nus", "cmu"):
++                constants.ROOT_QUAT_INIT = human_data["root_quaternion"][0]
++
+         # Create dummy object poses for robot_only
+         num_frames = human_joints.shape[0]
+         object_poses = np.tile(np.array([[1, 0, 0, 0, 0, 0, 0]]), (num_frames, 1))
+@@ -263,6 +266,16 @@ def load_motion_data(
+ 
+     elif task_type == "climbing":
+         task_dir = data_path / task_name
++        if data_format in ("parc", "hold"):
++            with np.load(task_dir / "motion.npz") as data:
++                human_joints = data["global_joint_positions"]
++                constants.ROOT_QUAT_INIT = data["root_quaternion"][0]
++                smpl_scale = constants.ROBOT_HEIGHT / float(data["height"])
++                object_poses = (
++                    data["object_poses"] if data_format == "hold"
++                    else np.tile([1., 0., 0., 0., 0., 0., 0.], (len(human_joints), 1))
++                )
++            return human_joints, object_poses, smpl_scale
+         npy_files = list(task_dir.glob("*.npy"))
+         if not npy_files:
+             raise FileNotFoundError(f"No .npy file found in {task_dir}")
+@@ -394,9 +407,12 @@ def _compute_q_init_base(
+         q_init_base in MuJoCo order: [0:3] position, [3:7] quaternion, [7:] joints
+     """
+     if task_type == "robot_only":
+-        if data_format == "lafan":
+-            spine_joint_idx = constants.DEMO_JOINTS.index("Spine1")
+-            human_quat_init = estimate_human_orientation(human_joints, constants.DEMO_JOINTS)
++        if data_format in ("lafan", "nus", "cmu"):
++            spine_joint_idx = constants.DEMO_JOINTS.index("upperback" if data_format == "cmu" else "Spine1")
++            human_quat_init = (
++                constants.ROOT_QUAT_INIT if data_format in ("nus", "cmu")
++                else estimate_human_orientation(human_joints, constants.DEMO_JOINTS)
++            )
+             # MuJoCo order: pos first, then quat
+             q_init_base = np.concatenate(
+                 [human_joints[0, spine_joint_idx, :3], human_quat_init, np.zeros(constants.ROBOT_DOF)]
+@@ -416,10 +432,13 @@ def _compute_q_init_base(
+     elif task_type == "climbing":
+         if retargeter is None:
+             raise ValueError("retargeter is required for climbing task")
+-        _, human_quat_init = transform_from_human_to_world(
+-            human_joints[0, 0, :], object_poses[0], np.array([0.0, 0.0, 0.0])
+-        )
+-        spine_joint_idx = retargeter.demo_joints.index("Spine1")
++        if data_format in ("parc", "hold"):
++            human_quat_init = constants.ROOT_QUAT_INIT
++        else:
++            _, human_quat_init = transform_from_human_to_world(
++                human_joints[0, 0, :], object_poses[0], np.array([0.0, 0.0, 0.0])
++            )
++        spine_joint_idx = retargeter.demo_joints.index("torso" if data_format == "parc" else "Spine1")
+         # MuJoCo order: pos first, then quat
+         q_init_base = np.concatenate(
+             [
+@@ -664,7 +683,12 @@ def main(cfg: RetargetingConfig) -> None:
+     logger.info("Retargeter created")
+ 
+     # Preprocess motion data
+-    if task_type == "robot_only":
++    if data_format in ("parc", "hold"):
++        # Motion and tracked terrain share an absolute frame; scale both without
++        # independently grounding the motion (clips may begin on a platform).
++        human_joints = human_joints * smpl_scale
++        object_poses[:, 4:] *= smpl_scale
++    elif task_type == "robot_only":
+         human_joints = preprocess_motion_data(human_joints, retargeter, toe_names, smpl_scale)
+     elif task_type in {"object_interaction", "climbing"}:
+         human_joints, object_poses, object_moving_frame_idx = preprocess_motion_data(
 diff --git a/src/holosoma_retargeting/holosoma_retargeting/src/interaction_mesh_retargeter.py b/src/holosoma_retargeting/holosoma_retargeting/src/interaction_mesh_retargeter.py
 index 4de725d..a8741d1 100644
 --- a/src/holosoma_retargeting/holosoma_retargeting/src/interaction_mesh_retargeter.py
