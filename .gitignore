@@ -38,3 +38,7 @@ motions/
 
 # Local tools, experiments and generated data
 /.cache/
+
+AGENTS.md
+# Machine-specific environment configuration
+/.local/

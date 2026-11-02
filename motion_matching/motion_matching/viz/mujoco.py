@@ -112,7 +112,7 @@ class ViserMujoco:
 
     def update_cfg(self, joint_angles: np.ndarray) -> None:
         self.data.qpos[self.spec.joint_qpos_indices] = joint_angles
-        mj.mj_forward(self.model, self.data)
+        mj.mj_kinematics(self.model, self.data)
         for geom, handle in self._handles:
             rotation = np.empty(4)
             mj.mju_mat2Quat(rotation, self.data.geom_xmat[geom])

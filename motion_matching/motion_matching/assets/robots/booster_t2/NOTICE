@@ -9,3 +9,10 @@ This distribution uses the existing PHP T2 motion-processing model variant:
 visual/debug sphere markers do not participate in collisions, and two jointless
 hand contact helper bodies are retained. Packaging only relocates mesh paths
 to the adjacent meshes directory; it does not change model parameters.
+
+The optional t2_31dof_sphere_locked.xml variant replaces fist visuals/collisions
+with the existing G1 half_sphere.obj asset from the packaged unitree_description.
+It retains all 31 joint channels, adds six constant-zero wrist joint equalities,
+and moves the hand contact helper frames to the sphere bases. Existing T2
+inertial parameters are retained; this variant is intended for kinematic
+retargeting and has not been validated as a physical hardware model.

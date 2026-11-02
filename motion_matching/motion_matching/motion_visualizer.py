@@ -223,6 +223,7 @@ def main(
     load_meshes: bool = True,
     load_collision_meshes: bool = False,
     show_vel_cmd: bool = False,
+    port: int = 8080,
 ) -> None:
     """View motion with Robot, Stage and Seq selectors in a shared sidebar.
 
@@ -238,6 +239,7 @@ def main(
         load_meshes: Load visual meshes.
         load_collision_meshes: Load collision meshes.
         show_vel_cmd: Show velocity commands in a matplotlib window.
+        port: HTTP and websocket server port.
     """
     def paired_terrain_files(path: Path) -> list[Path]:
         stems = dict.fromkeys((path.stem.replace("_motion", "_terrain"), path.stem + "_terrain"))
@@ -307,7 +309,7 @@ def main(
         }
     initial_robot = next(iter(catalog))
     initial_stage = next(iter(catalog[initial_robot]))
-    server = viser.ViserServer()
+    server = viser.ViserServer(port=port)
     root_frame = add_world_scene(server)
 
     with server.gui.add_folder("Motion"):
@@ -417,7 +419,10 @@ def main(
             mesh = trimesh.load(terrain, force="mesh")
             terrain_handle = server.scene.add_mesh_trimesh("/terrain", mesh=mesh)
 
+    last_panel_update = 0.0
+
     def draw_pose(index: int) -> None:
+        nonlocal last_panel_update
         joints, roots, _, _, _ = state["motion"]
         with server.atomic():
             renderer.update_cfg(joints[index])
@@ -426,11 +431,15 @@ def main(
             if object_handle is not None:
                 object_handle.position = object_qpos[index, :3]
                 object_handle.wxyz = object_qpos[index, 3:7]
-            for slider, value in zip(joint_sliders, joints[index]):
-                slider.value = float(value)
-            euler = Rotation.from_quat(roots[index, [4, 5, 6, 3]]).as_euler("xyz")
-            for slider, value in zip(root_sliders, np.concatenate((roots[index, :3], euler))):
-                slider.value = float(value)
+            now = time.perf_counter()
+            if not play.value or now - last_panel_update >= 0.1:
+                last_panel_update = now
+                frame.value = index
+                for slider, value in zip(joint_sliders, joints[index]):
+                    slider.value = float(value)
+                euler = Rotation.from_quat(roots[index, [4, 5, 6, 3]]).as_euler("xyz")
+                for slider, value in zip(root_sliders, np.concatenate((roots[index, :3], euler))):
+                    slider.value = float(value)
             contacts = state["contacts"]
             contact_label.value = (
                 f"L: {int(contacts[index, 0])}  R: {int(contacts[index, 1])}"
@@ -440,13 +449,15 @@ def main(
                 visible = contacts is not None and show_contact_markers.value and bool(contacts[index, side])
                 if visible:
                     # Same marker geometry and styling as play_database.py/run.py.
-                    contact_markers[side] = server.scene.add_icosphere(
-                        f"/contact_marker/{name}", position=state["contact_positions"][index, side],
-                        radius=0.06, color=np.array([0, 100, 255]), subdivisions=2,
-                    )
+                    if contact_markers[side] is None:
+                        contact_markers[side] = server.scene.add_icosphere(
+                            f"/contact_marker/{name}", radius=0.06,
+                            color=np.array([0, 100, 255]), subdivisions=2,
+                        )
+                    contact_markers[side].visible = True
+                    contact_markers[side].position = state["contact_positions"][index, side]
                 elif contact_markers[side] is not None:
-                    contact_markers[side].remove()
-                    contact_markers[side] = None
+                    contact_markers[side].visible = False
             commands = state["motion"][4]
             info_command.value = (
                 VEL_CMD_MAPPING.get(int(np.argmax(commands[index])), "Undefined")
@@ -479,6 +490,7 @@ def main(
         info_fps.value = f"{motion[3]:g}"
         load_terrain(path, range_index)
         draw_pose(0)
+        state["playback_time"] = time.perf_counter()
         print(f"Loaded {path}: {len(motion[0])} frames @ {motion[3]:g} FPS")
 
     def select_stage() -> None:
@@ -512,6 +524,10 @@ def main(
         joint_sliders = []
         joint_folder = server.gui.add_folder("Joint Values (DOF)", expand_by_default=False)
         limits = renderer.get_actuated_joint_limits()
+        locked_names = set()
+        if spec is not None:
+            from motion_matching.retarget_g1_to_t2 import locked_wrist_names
+            locked_names = set(locked_wrist_names(spec.model))
         with joint_folder:
             for name in renderer.get_actuated_joint_names():
                 lower, upper = limits[name]
@@ -521,6 +537,7 @@ def main(
                     name, min=lower, max=upper, step=0.001, initial_value=float(np.clip(0.0, lower, upper)),
                 )
                 slider.on_update(edit_joints)
+                slider.disabled = name in locked_names
                 joint_sliders.append(slider)
         stage_select.options = list(catalog[robot_select.value])
         stage_select.value = stage_select.options[0]
@@ -707,8 +724,10 @@ def main(
             fps = 30.0
             if state["motion"] is not None:
                 count, fps = len(state["motion"][0]), state["motion"][3]
+                elapsed = max(0.0, start - state.get("playback_time", start))
+                state["playback_time"] = start
                 if play.value:
-                    state["frame"] += speed.value
+                    state["frame"] += elapsed * fps * speed.value
                     if state["frame"] >= count:
                         options = list(catalog[robot_select.value][stage_select.value])
                         next_index = options.index(seq_select.value) + 1
@@ -721,10 +740,9 @@ def main(
                         else:
                             state["frame"] = count - 1
                             play.value = False
-                    frame.value = int(state["frame"])
                     draw_pose(int(state["frame"]))
                 else:
-                    state["frame"] = float(frame.value)
+                    frame.value = int(state["frame"])
                 index = int(state["frame"])
                 commands = state["motion"][4]
                 if commands is not None:

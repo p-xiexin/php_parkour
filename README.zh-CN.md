@@ -193,3 +193,32 @@ T2 移动合成使用上述 Python 接口。
 - `motion_matching/motion_matching/robots/`：读取 T2 原生模型、关节轴、静态绑定旋转和身体映射。
 - `generate_t2_database.py` 与匹配/导出接口：支持 31 关节骨架、T2 镜像和 tracking 格式。
 - `thirdparty/holosoma_t2.patch`：Holosoma 固定为 `4a0bf04cde5930af5ed59da797568d32be972525`；补丁注册 T2 模型及 LAFAN、SMPL-X、NUS、CMU、PARC、HOLD 关节映射；NUS/PARC/HOLD 使用源根朝向初始化，PARC/HOLD 保留动作与配对场景的共同坐标。其余兼容项包括 qpos 关节限位地址、`robot_only` 对象位姿赋值和 MuJoCo Jacobian 参数；优化器与约束保持上游实现。
+
+## G1 → T2 全库重定向
+
+使用球形手、锁腕 T2 模型，转换官方 19 个 BIN，并保留原帧率和动作区间。
+
+```bash
+python -m pip install -e './motion_matching[gmr]'
+git clone https://github.com/YanjieZe/GMR.git /path/to/GMR
+git -C /path/to/GMR checkout 25f56db79ac411258b377b6d4ccba0c8ff3372ac
+python -m motion_matching.retarget_g1_to_t2 \
+  --source-dir /path/to/g1/databases \
+  --output-dir /path/to/t2/databases \
+  --model motion_matching/motion_matching/assets/robots/booster_t2/mjcf/t2_31dof_sphere_locked.xml \
+  --gmr-root /path/to/GMR
+python scripts/verify_t2_bank.py \
+  --source /path/to/g1/databases --bank /path/to/t2/databases \
+  --report /path/to/outputs/t2_bank_verification.json
+```
+
+下游使用相同 T2 模型和输出目录的 `registry.json`。本机可视化：
+
+```bash
+source .local/activate_t2_bank.sh
+python -m motion_matching.motion_visualizer \
+  --motion-file "$PHP_MOTION_DATABASE_DIR"/*.bin --robot t2 \
+  --model-path "$PHP_T2_MJCF" --port 8000
+```
+
+输出仍有穿地和自碰，尚未通过动力学验证。
