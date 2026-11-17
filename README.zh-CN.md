@@ -196,29 +196,36 @@ T2 移动合成使用上述 Python 接口。
 
 ## G1 → T2 全库重定向
 
-使用球形手、锁腕 T2 模型，转换官方 19 个 BIN，并保留原帧率和动作区间。
+正式流程：**G1 BIN → GMR 初始化 → SQP 约束优化 → T2 BIN**。
+输入为官方 60 Hz G1 BIN；保留 19 个 BIN 的全部帧、动作区间与配对地形，使用 T2 官方关节限位、锁腕和球形末端模型。
+
+### 安装与转换
 
 ```bash
-python -m pip install -e './motion_matching[gmr]'
+# 在独立 Python 3.11 环境中，从仓库根目录执行
+python -m pip install -r retargeting/requirements.txt
+export PYTHONPATH="$PWD:$PWD/motion_matching${PYTHONPATH:+:$PYTHONPATH}"
 git clone https://github.com/YanjieZe/GMR.git /path/to/GMR
 git -C /path/to/GMR checkout 25f56db79ac411258b377b6d4ccba0c8ff3372ac
-python -m motion_matching.retarget_g1_to_t2 \
+python -m retargeting \
   --source-dir /path/to/g1/databases \
   --output-dir /path/to/t2/databases \
-  --model motion_matching/motion_matching/assets/robots/booster_t2/mjcf/t2_31dof_sphere_locked.xml \
   --gmr-root /path/to/GMR
-python scripts/verify_t2_bank.py \
-  --source /path/to/g1/databases --bank /path/to/t2/databases \
-  --report /path/to/outputs/t2_bank_verification.json
 ```
 
-下游使用相同 T2 模型和输出目录的 `registry.json`。本机可视化：
+默认 80 次迭代、窗口 1200 帧、2 个并行进程。源 database 保持只读；完整动作区间求解通过后才导出 BIN。
+输出包含 19 个 BIN、配对地形、`registry.json` 和 `bank_report.json`。区间结果保存在相邻的 `<output-dir>_work/`：`report.json` 记录输入、状态和迭代历史，`trajectory.npz` 保存唯一的轨迹结果及核验目标；另保留场景、GMR 配置和接触阶段。检查点在区间完成后删除。
+
+使用相同代码、输入和参数重复命令可续跑。旧格式数据继续支持只读核验；重新生成或更换代码时使用新输出目录。
+
+实现、测试和依赖清单统一位于顶层 `retargeting/`，与 `motion_matching/` 并列；复用现有 BIN 编解码、机器人模型与元数据。
+
+### 核验
 
 ```bash
-source .local/activate_t2_bank.sh
-python -m motion_matching.motion_visualizer \
-  --motion-file "$PHP_MOTION_DATABASE_DIR"/*.bin --robot t2 \
-  --model-path "$PHP_T2_MJCF" --port 8000
+python -m retargeting.verify_t2_bank \
+  --source /path/to/g1/databases --bank /path/to/t2/databases \
+  --report /path/to/verification.json
 ```
 
-输出仍有穿地和自碰，尚未通过动力学验证。
+默认核对文件哈希、完整帧数和区间、腕锁及关节限位；增加 `--geometry` 可利用保留的求解记录，对解码后的 BIN 重新检查接触和穿透约束。

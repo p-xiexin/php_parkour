@@ -526,7 +526,7 @@ def main(
         limits = renderer.get_actuated_joint_limits()
         locked_names = set()
         if spec is not None:
-            from motion_matching.retarget_g1_to_t2 import locked_wrist_names
+            from motion_matching.robots.base import locked_wrist_names
             locked_names = set(locked_wrist_names(spec.model))
         with joint_folder:
             for name in renderer.get_actuated_joint_names():

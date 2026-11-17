@@ -1,0 +1,8 @@
+# Isolated GMR + SQP runtime; leave the main G1 environment unchanged.
+numpy==1.26.0
+scipy==1.15.3
+mujoco==3.12.0
+clarabel==0.11.1
+mink==0.0.13
+daqp==0.10.3
+rich==14.3.4

@@ -12,6 +12,17 @@ import numpy as np
 from motion_matching.kinematics import quat
 
 
+def locked_wrist_names(model):
+    """The variant declares physical locks as constant joint equalities."""
+    return [
+        model.joint(int(model.eq_obj1id[i])).name
+        for i in range(model.neq)
+        if model.eq_type[i] == mj.mjtEq.mjEQ_JOINT
+        and model.eq_obj2id[i] == -1
+        and "_wrist_" in model.joint(int(model.eq_obj1id[i])).name
+    ]
+
+
 class RobotSpec:
     def __init__(self, robot_id: str, model_path: str | Path, *, pelvis_body: str,
                  left_foot_body: str = "left_ankle_roll_link",

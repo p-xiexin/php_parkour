@@ -1,4 +1,5 @@
 <mujoco model="T2_g1_sphere_locked_wrists">
+  <!-- Ankle pitch limits (-37 to 19 degrees): https://docs.booster.tech/zh-CN/docs/product-manual/t2/getting-started/specifications/ -->
   <compiler angle="radian" meshdir="../meshes" autolimits="true" />
   <option timestep="0.001" tolerance="1e-6" impratio="10" solver="Newton" />
   <default>
@@ -225,7 +226,7 @@
                     </body>
                     <body name="left_ankle_pitch_link" pos="0.029576 0 -0.33515">
                       <inertial pos="-0.000276 0 -0.003164" quat="0.5 0.5 -0.5 0.5" mass="0.134325" diaginertia="2.7e-05 1.9e-05 1.8e-05" />
-                      <joint name="left_ankle_pitch_joint" pos="0 0 0" axis="0 1 0" range="-0.872665 0.610865" actuatorfrcrange="-60 60" armature="0.0407491567" />
+                      <joint name="left_ankle_pitch_joint" pos="0 0 0" axis="0 1 0" range="-0.6457718232379019 0.33161255787892263" actuatorfrcrange="-60 60" armature="0.0407491567" />
                       <geom class="visual" mesh="left_ankle_pitch_link" />
                       <body name="left_ankle_roll_link" pos="0 0 -0.008">
                         <inertial pos="0.028351 -5.8e-05 -0.012984" quat="3.30175e-05 0.686047 -0.000943244 0.727556" mass="0.578485" diaginertia="0.00177117 0.001677 0.000268825" />
@@ -287,7 +288,7 @@
                     </body>
                     <body name="right_ankle_pitch_link" pos="0.029576 0 -0.33515">
                       <inertial pos="-0.000276 0 -0.003164" quat="0.5 0.5 -0.5 0.5" mass="0.134325" diaginertia="2.7e-05 1.9e-05 1.8e-05" />
-                      <joint name="right_ankle_pitch_joint" pos="0 0 0" axis="0 1 0" range="-0.872665 0.610865" actuatorfrcrange="-60 60" armature="0.0407491567" />
+                      <joint name="right_ankle_pitch_joint" pos="0 0 0" axis="0 1 0" range="-0.6457718232379019 0.33161255787892263" actuatorfrcrange="-60 60" armature="0.0407491567" />
                       <geom class="visual" mesh="right_ankle_pitch_link" />
                       <body name="right_ankle_roll_link" pos="0 0 -0.008">
                         <inertial pos="0.028351 5.8e-05 -0.012984" quat="3.30175e-05 0.686047 -0.000943244 0.727556" mass="0.578485" diaginertia="0.00177117 0.001677 0.000268825" />
