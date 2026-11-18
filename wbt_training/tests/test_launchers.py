@@ -47,6 +47,10 @@ def launcher(tmp_path):
     scripts.mkdir(parents=True)
     for name in (*LAUNCHERS, "setup_env.sh"):
         shutil.copy2(SCRIPTS / name, scripts / name)
+    shutil.copy2(SCRIPTS / "motion_convert.py", scripts / "motion_convert.py")
+    configs = repo / "wbt_training" / "config_values"
+    configs.mkdir()
+    shutil.copy2(SCRIPTS.parent / "config_values" / "robot_config.py", configs / "robot_config.py")
     utils = repo / "wbt_training" / "utils"
     utils.mkdir()
     shutil.copy2(SCRIPTS.parent / "utils" / "registry.py", utils / "registry.py")
@@ -555,15 +559,17 @@ def test_logger_arguments_match_core_config_union(launcher):
 @pytest.mark.parametrize(
     "logger,expected_logger", [(None, "wandb"), ("disabled", "disabled")]
 )
+@pytest.mark.parametrize("robot", ["g1", "t2"])
 def test_complete_training_command_parses_against_php_presets(
-    launcher, name, finetune, logger, expected_logger
+    launcher, name, finetune, logger, expected_logger, robot
 ):
     import tyro
     from holosoma.utils.tyro_utils import TYRO_CONIFG
 
     from wbt_training.config_values.experiment import AnnotatedExperimentConfig
+    from wbt_training.config_values.t2_config import t2_robot
 
-    result, command = launcher(name, FINETUNE=finetune, LOGGER=logger)
+    result, command = launcher(name, FINETUNE=finetune, LOGGER=logger, ROBOT=robot)
     assert result.returncode == 0, result.stderr
     args = command["args"]
     config = tyro.cli(
@@ -571,6 +577,7 @@ def test_complete_training_command_parses_against_php_presets(
     )
     assert config.training.registry_name == launcher.registries[0]
     assert config.logger.type == expected_logger
+    assert config.robot.actions_dim == (t2_robot.actions_dim if robot == "t2" else 29)
     if name == "run_terrain_warp_distill.sh":
         assert config.training.teacher_checkpoint == str(launcher.checkpoints[0])
         assert config.algo.config.distillation_warmup_steps == 0

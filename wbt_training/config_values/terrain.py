@@ -1,4 +1,4 @@
-"""Terrain-specific presets + runtime hooks for G1 whole-body-tracking.
+"""Shared terrain settings, G1 motion presets and whole-body-tracking runtime hooks.
 
 Contents:
  * Preset configs: command / observation / randomization / reward / termination / action
@@ -21,7 +21,8 @@ from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from holosoma.config_types.action import ActionManagerCfg, ActionTermCfg
-from holosoma.config_types.command import CommandTermCfg
+from holosoma.config_types.command import CommandManagerCfg, CommandTermCfg
+from holosoma.config_types.curriculum import CurriculumManagerCfg, CurriculumTermCfg
 from holosoma.config_types.experiment import ExperimentConfig
 from holosoma.config_types.observation import (
     ObservationManagerCfg,
@@ -37,11 +38,12 @@ from holosoma.config_types.termination import TerminationManagerCfg, Termination
 from holosoma.config_values.wbt.g1.command import (
     g1_29dof_wbt_command,
     init_pose_config,
-    motion_config,
+)
+from holosoma.config_values.wbt.g1.command import (
+    motion_config as g1_motion_config,
 )
 from holosoma.config_values.wbt.g1.observation import critic_obs_shared_terms
 from holosoma.config_values.wbt.g1.randomization import base_step_terms
-from holosoma.config_values.wbt.g1.reward import g1_29dof_wbt_reward
 
 if TYPE_CHECKING:
     import torch
@@ -54,8 +56,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Command preset
 # ---------------------------------------------------------------------------
-terrain_adaptive_motion_config = replace(
-    motion_config,
+WBT_ADAPTIVE_MOTION_PARAMS = dict(
     start_at_timestep_zero_prob=0.0,
     freeze_at_timestep_zero_prob=0.0,
     adaptive_kernel_size=3,
@@ -63,34 +64,47 @@ terrain_adaptive_motion_config = replace(
     adaptive_alpha=0.001,
 )
 
+g1_terrain_adaptive_motion_config = replace(g1_motion_config, **WBT_ADAPTIVE_MOTION_PARAMS)
+
 wbt_terrain_init_pose_config = replace(
     init_pose_config, root_lin_vel=[0.1, 0.1, 0.05], root_ang_vel=[0.1, 0.1, 0.1]
 )
 
-wbt_terrain_motion_config = replace(
-    terrain_adaptive_motion_config,
-    # Teachers and students retain the compatibility branch's source-clip resets.
+WBT_MOTION_PARAMS = dict(
+    **WBT_ADAPTIVE_MOTION_PARAMS,
+    use_adaptive_timesteps_sampler=True,
+    adaptive_uniform_ratio=1e-6,
     resample_on_motion_end=True,
     enable_default_pose_prepend=False,
     enable_default_pose_append=False,
-    adaptive_uniform_ratio=1e-6,
     noise_to_initial_pose=wbt_terrain_init_pose_config,
 )
+
+wbt_motion_command = CommandManagerCfg(
+    reset_terms={
+        "motion_command": CommandTermCfg(func="holosoma.managers.command.terms.wbt:MotionCommand"),
+    },
+    step_terms={
+        "motion_command": CommandTermCfg(func="holosoma.managers.command.terms.wbt:MotionCommand"),
+    },
+)
+
+g1_terrain_motion_config = replace(g1_terrain_adaptive_motion_config, **WBT_MOTION_PARAMS)
 
 g1_29dof_wbt_terrain_command = replace(
     g1_29dof_wbt_command,
     setup_terms={
         "motion_command": CommandTermCfg(
             func="holosoma.managers.command.terms.wbt:MotionCommand",
-            params={"motion_config": wbt_terrain_motion_config},
+            params={"motion_config": g1_terrain_motion_config},
         )
     },
 )
 
 # Pelvis-anchored variant for new training. The torso variant above is
 # retained so existing checkpoints remain reproducible.
-wbt_terrain_motion_config_pelvis = replace(
-    wbt_terrain_motion_config, body_name_ref=["pelvis"]
+g1_terrain_motion_config_pelvis = replace(
+    g1_terrain_motion_config, body_name_ref=["pelvis"]
 )
 
 g1_29dof_wbt_terrain_command_pelvis = replace(
@@ -98,7 +112,7 @@ g1_29dof_wbt_terrain_command_pelvis = replace(
     setup_terms={
         "motion_command": CommandTermCfg(
             func="holosoma.managers.command.terms.wbt:MotionCommand",
-            params={"motion_config": wbt_terrain_motion_config_pelvis},
+            params={"motion_config": g1_terrain_motion_config_pelvis},
         )
     },
 )
@@ -159,7 +173,7 @@ wbt_terrain_actor_obs = ObsGroupCfg(
 
 critic_obs_terrain_terms = {**critic_obs_shared_terms, "height_scan": height_scan_term}
 
-g1_29dof_wbt_terrain_observation = ObservationManagerCfg(
+wbt_terrain_observation = ObservationManagerCfg(
     groups={
         "actor_obs": wbt_terrain_actor_obs,
         "critic_obs": ObsGroupCfg(
@@ -180,7 +194,7 @@ wbt_terrain_actor_obs_no_hs = replace(
     terms={k: v for k, v in wbt_terrain_actor_obs.terms.items() if k != "height_scan"},
 )
 
-g1_29dof_wbt_terrain_observation_no_heightscan = ObservationManagerCfg(
+wbt_terrain_observation_no_heightscan = ObservationManagerCfg(
     groups={
         "actor_obs": wbt_terrain_actor_obs_no_hs,
         "critic_obs": ObsGroupCfg(
@@ -276,7 +290,7 @@ wbt_terrain_reset_terms = {
     ),
 }
 
-g1_29dof_wbt_terrain_randomization = RandomizationManagerCfg(
+wbt_terrain_randomization = RandomizationManagerCfg(
     setup_terms={**wbt_terrain_setup_terms},
     reset_terms={**wbt_terrain_reset_terms},
     step_terms={**base_step_terms},
@@ -286,35 +300,59 @@ g1_29dof_wbt_terrain_randomization = RandomizationManagerCfg(
 # ---------------------------------------------------------------------------
 # Reward preset
 # ---------------------------------------------------------------------------
+wbt_terrain_reward_terms = {
+    "motion_global_ref_position_error_exp": RewardTermCfg(
+        func="holosoma.managers.reward.terms.wbt:motion_global_ref_position_error_exp",
+        params={"sigma": 0.3}, weight=1.0,
+    ),
+    "motion_global_ref_orientation_error_exp": RewardTermCfg(
+        func="holosoma.managers.reward.terms.wbt:motion_global_ref_orientation_error_exp",
+        params={"sigma": 0.4}, weight=1.0,
+    ),
+    "motion_relative_body_position_error_exp": RewardTermCfg(
+        func="holosoma.managers.reward.terms.wbt:motion_relative_body_position_error_exp",
+        params={"sigma": 0.3}, weight=1.0,
+    ),
+    "motion_relative_body_orientation_error_exp": RewardTermCfg(
+        func="holosoma.managers.reward.terms.wbt:motion_relative_body_orientation_error_exp",
+        params={"sigma": 0.4}, weight=1.0,
+    ),
+    "motion_global_body_lin_vel": RewardTermCfg(
+        func="holosoma.managers.reward.terms.wbt:motion_global_body_lin_vel",
+        params={"sigma": 1.0}, weight=1.0,
+    ),
+    "motion_global_body_ang_vel": RewardTermCfg(
+        func="holosoma.managers.reward.terms.wbt:motion_global_body_ang_vel",
+        params={"sigma": 3.14}, weight=1.0,
+    ),
+    "action_rate_l2": RewardTermCfg(
+        func="holosoma.managers.reward.terms.wbt:penalty_action_rate", weight=-0.1,
+    ),
+    "limits_dof_pos": RewardTermCfg(
+        func="holosoma.managers.reward.terms.wbt:limits_dof_pos",
+        params={"soft_dof_pos_limit": 0.9}, weight=-10.0,
+    ),
+}
+
+wbt_undesired_contacts = RewardTermCfg(
+    func="holosoma.managers.reward.terms.wbt:UndesiredContacts",
+    params={"threshold": 1.0}, weight=-0.5,
+)
+
 g1_29dof_wbt_terrain_reward = RewardManagerCfg(
     terms={
-        **g1_29dof_wbt_reward.terms,
-        "motion_global_ref_position_error_exp": RewardTermCfg(
-            func="holosoma.managers.reward.terms.wbt:motion_global_ref_position_error_exp",
-            params={"sigma": 0.3},
-            weight=1.0,
-        ),
-        "motion_global_ref_orientation_error_exp": RewardTermCfg(
-            func="holosoma.managers.reward.terms.wbt:motion_global_ref_orientation_error_exp",
-            params={"sigma": 0.4},
-            weight=1.0,
-        ),
-        "limits_dof_pos": RewardTermCfg(
-            func="holosoma.managers.reward.terms.wbt:limits_dof_pos",
-            params={"soft_dof_pos_limit": 0.9},
-            weight=-10.0,
-        ),
+        **wbt_terrain_reward_terms,
         "undesired_contacts": RewardTermCfg(
             func="holosoma.managers.reward.terms.wbt:UndesiredContacts",
             params={
-                "threshold": 1.0,
+                **wbt_undesired_contacts.params,
                 "undesired_contacts_body_names": (
                     "^(?!left_foot_contact_point$)(?!right_foot_contact_point$)"
                     "(?!left_ankle_roll_link$)(?!right_ankle_roll_link$)"
                     "(?!left_wrist_yaw_link$)(?!right_wrist_yaw_link$).+$"
                 ),
             },
-            weight=-0.5,
+            weight=wbt_undesired_contacts.weight,
         ),
     }
 )
@@ -323,6 +361,30 @@ g1_29dof_wbt_terrain_reward = RewardManagerCfg(
 # ---------------------------------------------------------------------------
 # Termination preset
 # ---------------------------------------------------------------------------
+wbt_timeout = TerminationTermCfg(
+    func="holosoma.managers.termination.terms.common:timeout_exceeded", is_timeout=True,
+)
+
+wbt_bad_tracking = TerminationTermCfg(
+    func="holosoma.managers.termination.terms.wbt:BadTracking",
+    params={
+        "bad_ref_pos_threshold": 0.5,
+        "bad_ref_ori_threshold": 0.8,
+        "bad_motion_body_pos_threshold": 0.5,
+        "bad_object_pos_threshold": 0.25,
+        "bad_object_ori_threshold": 0.8,
+    },
+)
+
+wbt_terrain_curriculum = CurriculumManagerCfg(
+    params={"num_compute_average_epl": 1000},
+    setup_terms={
+        "average_episode_tracker": CurriculumTermCfg(
+            func="holosoma.managers.curriculum.terms.locomotion:AverageEpisodeLengthTracker",
+        ),
+    },
+)
+
 g1_29dof_wbt_terrain_termination = TerminationManagerCfg(
     terms={
         "timeout": TerminationTermCfg(
@@ -332,9 +394,7 @@ g1_29dof_wbt_terrain_termination = TerminationManagerCfg(
         "bad_tracking": TerminationTermCfg(
             func="holosoma.managers.termination.terms.wbt:BadTracking",
             params={
-                "bad_ref_pos_threshold": 0.5,
-                "bad_ref_ori_threshold": 0.8,
-                "bad_motion_body_pos_threshold": 0.5,
+                **wbt_bad_tracking.params,
                 "body_names_to_track": [
                     "pelvis",
                     "left_hip_roll_link",
@@ -357,8 +417,6 @@ g1_29dof_wbt_terrain_termination = TerminationManagerCfg(
                     "left_wrist_yaw_link",
                     "right_wrist_yaw_link",
                 ],
-                "bad_object_pos_threshold": 0.25,
-                "bad_object_ori_threshold": 0.8,
             },
         ),
     }
@@ -369,7 +427,7 @@ g1_29dof_wbt_terrain_termination = TerminationManagerCfg(
 # Implicit action preset (ref's position-target path; IsaacSim's built-in PD
 # drive applies torque from position targets).
 # ---------------------------------------------------------------------------
-g1_29dof_joint_pos_implicit = ActionManagerCfg(
+wbt_joint_pos_implicit = ActionManagerCfg(
     terms={
         "joint_control": ActionTermCfg(
             func="holosoma.managers.action.terms.joint_control:JointPositionTargetActionTerm",

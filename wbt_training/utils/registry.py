@@ -15,7 +15,6 @@ import re
 import shutil
 import sys
 import tempfile
-import zipfile
 from pathlib import Path
 
 ARTIFACT_TYPE = "terrains-motions"
@@ -94,6 +93,8 @@ def bundle_pairs(root: Path) -> list[tuple[Path, Path | None, Path | None]]:
 
 
 def validate_bundle(root: Path) -> None:
+    import numpy as np
+
     required = {
         "fps",
         "joint_pos",
@@ -106,23 +107,13 @@ def validate_bundle(root: Path) -> None:
         "body_names",
     }
     for motion, terrain, _ in bundle_pairs(root):
-        try:
-            with zipfile.ZipFile(motion) as archive:
-                keys = {
-                    Path(name).stem
-                    for name in archive.namelist()
-                    if name.endswith(".npy")
-                }
-        except (OSError, zipfile.BadZipFile) as error:
-            raise ValueError(f"Invalid motion NPZ {motion}: {error}") from error
-        if missing := required - keys:
-            raise ValueError(
-                f"Motion {motion} is missing native Holosoma fields {sorted(missing)}; "
-                "convert motion-matching outputs with motion_convert.py first"
-            )
+        with np.load(motion, allow_pickle=False) as data:
+            if missing := required - set(data.files):
+                raise ValueError(
+                    f"Motion {motion} is missing native Holosoma fields {sorted(missing)}; "
+                    "convert motion-matching outputs with motion_convert.py first"
+                )
         if terrain is not None:
-            import numpy as np
-
             data = np.load(terrain, allow_pickle=False)
             if not isinstance(data, np.ndarray):
                 data.close()
@@ -307,24 +298,21 @@ class RegistryResolver:
                     raw = Path(artifact.download(root=str(Path(tmp) / "raw")))
                     converted = Path(tmp) / "converted"
                     converted.mkdir()
+                    import numpy as np
+
+                    from wbt_training.training_runs.motion_convert import convert
+
                     for motion, terrain, obj in bundle_pairs(raw):
                         target = converted / motion.relative_to(raw)
                         target.parent.mkdir(parents=True, exist_ok=True)
-                        with zipfile.ZipFile(motion) as archive:
-                            native = {"body_names.npy", "joint_names.npy"}.issubset(
-                                archive.namelist()
-                            )
-                        if native:
+                        with np.load(motion, allow_pickle=False) as data:
+                            named = "joint_names" in data and "body_names" in data
+                        if named:
+                            # Prepared training motions are copied and validated below.
+                            # Convert raw T2 exports explicitly with --robot t2 first.
                             shutil.copy2(motion, target)
-                        else:
-                            from wbt_training.training_runs.motion_convert import (
-                                convert,
-                            )
-
-                            if not convert(str(motion), str(target)):
-                                raise ValueError(
-                                    f"Motion {motion} has fewer than two frames"
-                                )
+                        elif not convert(str(motion), str(target), robot="g1"):
+                            raise ValueError(f"Motion {motion} has fewer than two frames")
                         for sidecar in (terrain, obj):
                             if sidecar is not None:
                                 shutil.copy2(

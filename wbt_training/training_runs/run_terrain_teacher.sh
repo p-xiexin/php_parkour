@@ -8,6 +8,11 @@
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/setup_env.sh"
 php_launcher_init
+case "${ROBOT:-g1}" in
+    g1) EXP_PRESET=exp:g1-wbt-terrain-ref-noscale ;;
+    t2) EXP_PRESET=exp:t2-wbt-terrain-ref ;;
+    *) php_error 'ROBOT must be g1 or t2'; exit 1 ;;
+esac
 NGPUS="${NGPUS:-1}"
 php_positive_integer NGPUS "$NGPUS"
 php_prepare_inputs teacher ''
@@ -15,7 +20,7 @@ php_training_command
 php_select_training_gpu
 php_activate_sim
 exec "${TRAIN_COMMAND[@]}" -m wbt_training.train_agent \
-    exp:g1-wbt-terrain-ref-noscale simulator:isaacsim \
+    "$EXP_PRESET" simulator:isaacsim \
     --training.registry-name "$REGISTRY" \
     "${LOGGER_ARGS[@]}" --logger.video.enabled False \
     "$@"

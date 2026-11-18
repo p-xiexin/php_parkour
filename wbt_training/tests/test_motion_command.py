@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from holosoma.managers.command.terms.wbt import MotionCommand
-from wbt_training.config_values.depth_distillation import wbt_distill_motion_config
+from wbt_training.config_values.depth_distillation import g1_distill_motion_config
 from wbt_training.config_values.motion_command import PhpMotionCommand
 
 
@@ -39,8 +39,8 @@ def make_command(num_experts=5, num_envs=4096):
             motion_ends=torch.arange(total) == total - 1,
         ),
         motion_cfg=SimpleNamespace(
-            freeze_at_timestep_zero_prob=wbt_distill_motion_config.freeze_at_timestep_zero_prob,
-            resample_on_motion_end=wbt_distill_motion_config.resample_on_motion_end,
+            freeze_at_timestep_zero_prob=g1_distill_motion_config.freeze_at_timestep_zero_prob,
+            resample_on_motion_end=g1_distill_motion_config.resample_on_motion_end,
             use_adaptive_timesteps_sampler=False,
             body_names_to_track=["pelvis"],
         ),
@@ -99,8 +99,8 @@ def test_partial_sampling_preserves_other_environments():
 
 
 def test_distillation_explicitly_keeps_legacy_clip_resampling():
-    assert wbt_distill_motion_config.resample_on_motion_end is True
-    assert wbt_distill_motion_config.freeze_at_timestep_zero_prob == 0.0
+    assert g1_distill_motion_config.resample_on_motion_end is True
+    assert g1_distill_motion_config.freeze_at_timestep_zero_prob == 0.0
 
 
 def test_internal_clip_ends_reset_before_combined_file_end():
@@ -111,3 +111,48 @@ def test_internal_clip_ends_reset_before_combined_file_end():
     MotionCommand.step(cmd)
     assert cmd.motion_end_reset.tolist() == [True, True, False, True]
     assert cmd.time_steps.tolist() == [0, 0, 21, 0]
+
+
+def test_off_reference_states_are_masked_from_distillation_and_gate_statistics():
+    from holosoma.agents.modules.student_teacher_modules import StudentTeacher
+    from wbt_training.config_values.motion_command import which_motion
+    from wbt_training.utils.student_teacher import PhpDistillationPPO, RoutingColumnTeacherMixin
+
+    cmd = make_command(num_experts=2, num_envs=2)
+    cmd.time_steps[:] = torch.tensor([80, 81])
+    cmd.robot_ref_pos_w[1, 0] = 0.6  # Beyond teacher cutoff, inside relaxed termination.
+    cmd.body_pos_relative_w = torch.zeros(2, 1, 3)
+    cmd.robot_body_pos_w = torch.zeros(2, 1, 3)
+    env = SimpleNamespace(num_envs=2, device="cpu",
+                          command_manager=SimpleNamespace(get_state=lambda name: cmd))
+    routing = which_motion(env, bad_motion_body_pos_body_names=("pelvis",))
+    assert routing.tolist() == [[0.0], [-1.0]]
+
+    class RoutedPolicy(RoutingColumnTeacherMixin, StudentTeacher):
+        pass
+
+    policy = RoutedPolicy(num_actor_obs=1, num_teacher_obs=2, num_actions=1,
+                          student_hidden_dims=[], teacher_hidden_dims=[], activation="ELU",
+                          num_teachers=2, routing_column=1)
+    with torch.no_grad():
+        for i, teacher in enumerate(policy.teachers):
+            teacher[0].weight.zero_()
+            teacher[0].bias.fill_(i + 1.0)
+    policy.set_loaded_teachers([True, True])
+    teacher_obs = torch.cat([torch.zeros(2, 1), routing], dim=1)
+    targets = policy.teacher_act(teacher_obs)
+    torch.testing.assert_close(targets, torch.tensor([[1.0], [0.0]]))
+
+    # A lost expert's zero marker must not train the student toward zero.
+    student = torch.full_like(targets, 0.25, requires_grad=True)
+    algo = SimpleNamespace(distill_loss_fn=torch.nn.functional.mse_loss, env=env)
+    loss = PhpDistillationPPO._dagger_loss_per_sample(algo, student, targets)
+    loss.sum().backward()
+    torch.testing.assert_close(loss, torch.tensor([0.5625, 0.0]))
+    torch.testing.assert_close(student.grad, torch.tensor([[-1.5], [0.0]]))
+    gate_samples = []
+    cmd.observe_dagger_residual = lambda residual, keep: gate_samples.append((residual, keep))
+    PhpDistillationPPO._update_ppo_gate_stats(algo, student, targets)
+    residual, keep = gate_samples[0]
+    torch.testing.assert_close(residual, torch.tensor([0.5625, 0.0625]))
+    assert keep.tolist() == [True, False]

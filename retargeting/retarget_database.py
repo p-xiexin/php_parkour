@@ -636,6 +636,9 @@ def _copy_bank_assets(source_dir, output_dir, terrains):
         )
         for skill, cfg in SKILL_REGISTRY.items()
     }
+    # The mirrored climb_76 clip starts at 674; keep its search interval in
+    # the exported bank metadata, alongside the other source-frame ranges.
+    registry["climb_76_down"]["search_ranges"] = [(515, 521, 645), (1189, 1195, 1319)]
     write_json(output_dir / "registry.json", registry)
 
 

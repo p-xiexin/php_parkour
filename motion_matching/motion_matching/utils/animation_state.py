@@ -1,12 +1,11 @@
 """Motion matching algorithm helpers: inertialization and trajectory/contact/query utilities."""
 
 from dataclasses import dataclass
-
 from typing import Any, Tuple
 
 import numpy as np
-import motion_matching.utils.math_utils as math
 
+import motion_matching.utils.math_utils as math
 
 # ----------------------------- Inertialization -----------------------------
 
@@ -101,11 +100,21 @@ def inertialize_update_vec3(
 
 
 def inertialize_transition_quat(
-    off_x: np.ndarray, off_v: np.ndarray, src_x: np.ndarray, src_v: np.ndarray, dst_x: np.ndarray, dst_v: np.ndarray
+    off_x: np.ndarray, off_v: np.ndarray, src_x: np.ndarray, src_v: np.ndarray, dst_x: np.ndarray, dst_v: np.ndarray,
+    *, correct_velocity: bool = False,
 ) -> None:
-    """Transition inertializer for quaternions"""
+    """Transfer quaternion offsets, optionally preserving the rendered twist.
+
+    Angular velocities are expressed in the parent frame. The current output
+    is ``off_v + R(off_x) src_v``, as in ``inertialize_update_quat``.
+    """
+    if correct_velocity:
+        output_velocity = off_v + math.quat_mul_vec3(off_x, src_v)
     off_x[:] = math.quat_abs(math.quat_mul(math.quat_mul(off_x, src_x), math.quat_inv(dst_x)))
-    off_v[:] = (off_v + src_v) - dst_v
+    if correct_velocity:
+        off_v[:] = output_velocity - math.quat_mul_vec3(off_x, dst_v)
+    else:
+        off_v[:] = (off_v + src_v) - dst_v
 
 
 def inertialize_update_quat(
@@ -162,8 +171,17 @@ def inertialize_pose_transition(
     bone_dst_velocities: np.ndarray,
     bone_dst_rotations: np.ndarray,
     bone_dst_angular_velocities: np.ndarray,
+    *,
+    correct_state_transfer: bool = False,
 ) -> None:
-    """Transition the inertializer for the full character"""
+    """Transfer the full character to another animation frame.
+
+    ``root_*`` already describe the rendered output, including the old root
+    offsets. Correct transfer absorbs its pose into the new root anchor and
+    stores only the velocity difference. Other bones still receive raw source
+    animation values, so their existing offsets must be composed with them.
+    The default preserves the legacy transfer for existing G1 callers.
+    """
     bone_offset_positions = state.bone_offset_positions
     bone_offset_velocities = state.bone_offset_velocities
     bone_offset_rotations = state.bone_offset_rotations
@@ -188,24 +206,31 @@ def inertialize_pose_transition(
         transition_dst_rotation, math.quat_inv_mul_vec3(transition_src_rotation, bone_dst_angular_velocities[0])
     )
 
-    # Transition inertializers recording the offsets for the root joint
-    inertialize_transition_vec3(
-        off_x=bone_offset_positions[0],
-        off_v=bone_offset_velocities[0],
-        src_x=root_position,
-        src_v=root_velocity,
-        dst_x=root_position,
-        dst_v=world_space_dst_velocity,
-    )
+    if correct_state_transfer:
+        # The new anchor is the output pose itself: retaining an old offset
+        # would apply it a second time. Root velocities also include offsets.
+        bone_offset_positions[0] = 0.0
+        bone_offset_rotations[0] = [1.0, 0.0, 0.0, 0.0]
+        bone_offset_velocities[0] = root_velocity - world_space_dst_velocity
+        bone_offset_angular_velocities[0] = root_angular_velocity - world_space_dst_angular_velocity
+    else:
+        inertialize_transition_vec3(
+            off_x=bone_offset_positions[0],
+            off_v=bone_offset_velocities[0],
+            src_x=root_position,
+            src_v=root_velocity,
+            dst_x=root_position,
+            dst_v=world_space_dst_velocity,
+        )
 
-    inertialize_transition_quat(
-        off_x=bone_offset_rotations[0],
-        off_v=bone_offset_angular_velocities[0],
-        src_x=root_rotation,
-        src_v=root_angular_velocity,
-        dst_x=root_rotation,
-        dst_v=world_space_dst_angular_velocity,
-    )
+        inertialize_transition_quat(
+            off_x=bone_offset_rotations[0],
+            off_v=bone_offset_angular_velocities[0],
+            src_x=root_rotation,
+            src_v=root_angular_velocity,
+            dst_x=root_rotation,
+            dst_v=world_space_dst_angular_velocity,
+        )
 
     # Transition all the inertializers for each other bone
     for i in range(1, len(bone_offset_positions)):
@@ -225,6 +250,7 @@ def inertialize_pose_transition(
             src_v=bone_src_angular_velocities[i],
             dst_x=bone_dst_rotations[i],
             dst_v=bone_dst_angular_velocities[i],
+            correct_velocity=correct_state_transfer,
         )
 
 

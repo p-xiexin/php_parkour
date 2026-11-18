@@ -41,6 +41,7 @@ include = ["motion_matching*"]
 
 [tool.setuptools.package-data]
 motion_matching = [
+    "configs/*.json",
     "assets/robot_motions/*.npz",
     "assets/robots/unitree_description/package.xml",
     "assets/robots/unitree_description/mjcf/*.xml",

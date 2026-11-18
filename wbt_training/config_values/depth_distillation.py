@@ -15,7 +15,6 @@ The depth term name + group name must match the constants in
 from __future__ import annotations
 
 from dataclasses import replace
-
 from dataclasses import replace as _replace
 
 from holosoma.config_types.command import CommandTermCfg
@@ -30,8 +29,8 @@ from holosoma.config_values.wbt.g1.curriculum import g1_29dof_wbt_curriculum
 from wbt_training.config_values.terrain import (
     critic_obs_terrain_terms,
     g1_29dof_wbt_terrain_command,
+    g1_terrain_motion_config,
     wbt_terrain_actor_obs,
-    wbt_terrain_motion_config,
 )
 
 # NB: we pass the camera config as a dotted-path string rather than an
@@ -121,29 +120,33 @@ wbt_distill_critic_obs = ObsGroupCfg(
 
 # Depth group: single ``depth_cam`` term backed by the Warp ray-caster. Kept in
 # its own non-concatenating group because images are 3D tensors.
-depth_cam_term = ObsTermCfg(
+WBT_DEPTH_PARAMS = {
+    "command_name": "motion_command",
+    "latency_frame": (3, 4),
+    "resize": (58, 87),
+    "buffer_len": 6,
+    "enable_holes": True,
+    # Populated by ``apply_terrain_preprocess`` at config-build time — see
+    # terrain.py. Non-None required at term __init__.
+    "terrain_mesh_vertices": None,
+    "terrain_mesh_faces": None,
+}
+
+g1_depth_cam_term = ObsTermCfg(
     func="holosoma.managers.observation.terms.depth:WarpDepthImageObsTerm",
     scale=1.0,
     noise=0.0,
     params={
         "camera_sensor_cfg": _G1_FLAT_D435I_PATH,
-        "command_name": "motion_command",
-        "latency_frame": (3, 4),
-        "resize": (58, 87),
-        "buffer_len": 6,
-        "enable_holes": True,
-        # Populated by ``apply_terrain_preprocess`` at config-build time — see
-        # terrain.py. Non-None required at term __init__.
-        "terrain_mesh_vertices": None,
-        "terrain_mesh_faces": None,
+        **WBT_DEPTH_PARAMS,
     },
 )
 
-wbt_distill_depth_obs = ObsGroupCfg(
+g1_distill_depth_obs = ObsGroupCfg(
     concatenate=False,
     enable_noise=False,
     history_length=1,
-    terms={"depth_cam": depth_cam_term},
+    terms={"depth_cam": g1_depth_cam_term},
 )
 
 g1_29dof_wbt_terrain_distill_observation = ObservationManagerCfg(
@@ -151,7 +154,7 @@ g1_29dof_wbt_terrain_distill_observation = ObservationManagerCfg(
         "actor_obs": wbt_distill_actor_obs,
         "critic_obs": wbt_distill_critic_obs,
         "teacher_obs": wbt_distill_teacher_obs,
-        "depth_camera": wbt_distill_depth_obs,
+        "depth_camera": g1_distill_depth_obs,
     }
 )
 
@@ -194,9 +197,65 @@ g1_29dof_wbt_terrain_distill_curriculum = _replace(
 # RL to over-weight failing phases); the student sees a uniform-in-time
 # distribution of motion frames so Loss/behavior is comparable across the
 # two codebases.
-wbt_distill_motion_config = replace(
-    wbt_terrain_motion_config, use_adaptive_timesteps_sampler=False
+g1_distill_motion_config = replace(
+    g1_terrain_motion_config, use_adaptive_timesteps_sampler=False
 )
+
+WBT_DISTILL_GATE_PARAMS = {
+    # Residual-gated PPO, driven entirely by the per-phase DAgger
+    # residual -- there is no hand-written phase criterion. **On by
+    # default**, so every distill run gets it; set this False (or
+    # ``ppo_gate_adaptive`` 0) to recover the plain scalar-``ppo_coef``
+    # loss exactly. Every key must be present here to be settable at
+    # all -- tyro derives the
+    # ``--command.setup-terms.motion-command.params.*`` flags from
+    # this dict's keys. See PhpMotionCommand._attach_ppo_gate.
+    "ppo_gate_enabled": True,
+    # Backward smear on the residual table, in seconds (bins are ~1 s,
+    # so this is also the bin count). GAE propagates a phase's
+    # advantage back in time, so the frames that set up a hard phase
+    # need PPO weight too. 0 disables the smear.
+    "ppo_gate_pre_s": 1.0,
+    # Floor of the table: the PPO weight a phase gets when its residual
+    # says imitation is already handling it.
+    #
+    # Do not set this to 0. Wherever the gate is at its floor,
+    # ``which_motion`` can independently mask the DAgger term, and at
+    # a floor of 0 that leaves the sample with no gradient from either
+    # term -- self-sealing, since the mask fires precisely where the
+    # policy is already off-track. A run with floor 0 tracked its
+    # gated phases correctly and then collapsed in the ungated ones.
+    # Only values near 0 are dangerous; the floor is otherwise a soft
+    # knob, and what it buys is ``low * ppo_coef`` on an easy bin --
+    # 0.45 here against 0.9 on a hard one.
+    "ppo_gate_low": 0.5,
+    # How much the residual table modulates the gate, blended against
+    # all-ones: 1 = fully residual-driven, 0 = all-ones, i.e. the
+    # ungated scalar-``ppo_coef`` loss reproduced exactly. All-ones is
+    # also what the gate returns before the EMA warms up -- "no
+    # information yet" must mean *full* reward pressure, never none,
+    # since a gate reading ~0 everywhere is the pure-DAgger regime,
+    # which can lose a skill the policy already had.
+    "ppo_gate_adaptive": 1.0,
+    # Residual quantiles bracketing the ramp: bins at or below
+    # `_lo` sit at the floor, bins at or above `_hi` get full weight.
+    # Must be a ramp between two quantiles, not a division by one --
+    # with the hard phase a minority of bins, dividing by a single
+    # quantile saturates the whole table. Watch `Env/ppo_gate_spread`:
+    # it goes to 0 exactly when the table has stopped distinguishing
+    # phases, which `Loss/ppo_gate_mean` cannot tell you.
+    "ppo_gate_quantile_lo": 0.50,
+    "ppo_gate_quantile_hi": 0.95,
+    # EMA rate for the per-bin residual, matching
+    # AdaptiveTimestepSampler's adaptive_alpha. Slow on purpose:
+    # raising PPO where the residual is high changes the residual, so
+    # the loop needs a time constant well above one iteration.
+    "ppo_gate_ema_alpha": 0.001,
+    # Unmasked samples required before the residual table is used at
+    # all; until then the gate is all-ones. A cold EMA reads ~0
+    # everywhere, and acting on that is the pure-DAgger regime above.
+    "ppo_gate_warmup_samples": 5.0e5,
+}
 
 g1_29dof_wbt_terrain_distill_command = replace(
     g1_29dof_wbt_terrain_command,
@@ -204,60 +263,8 @@ g1_29dof_wbt_terrain_distill_command = replace(
         "motion_command": CommandTermCfg(
             func="wbt_training.config_values.motion_command:PhpMotionCommand",
             params={
-                "motion_config": wbt_distill_motion_config,
-                # Residual-gated PPO, driven entirely by the per-phase DAgger
-                # residual -- there is no hand-written phase criterion. **On by
-                # default**, so every distill run gets it; set this False (or
-                # ``ppo_gate_adaptive`` 0) to recover the plain scalar-``ppo_coef``
-                # loss exactly. Every key must be present here to be settable at
-                # all -- tyro derives the
-                # ``--command.setup-terms.motion-command.params.*`` flags from
-                # this dict's keys. See PhpMotionCommand._attach_ppo_gate.
-                "ppo_gate_enabled": True,
-                # Backward smear on the residual table, in seconds (bins are ~1 s,
-                # so this is also the bin count). GAE propagates a phase's
-                # advantage back in time, so the frames that set up a hard phase
-                # need PPO weight too. 0 disables the smear.
-                "ppo_gate_pre_s": 1.0,
-                # Floor of the table: the PPO weight a phase gets when its residual
-                # says imitation is already handling it.
-                #
-                # Do not set this to 0. Wherever the gate is at its floor,
-                # ``which_motion`` can independently mask the DAgger term, and at
-                # a floor of 0 that leaves the sample with no gradient from either
-                # term -- self-sealing, since the mask fires precisely where the
-                # policy is already off-track. A run with floor 0 tracked its
-                # gated phases correctly and then collapsed in the ungated ones.
-                # Only values near 0 are dangerous; the floor is otherwise a soft
-                # knob, and what it buys is ``low * ppo_coef`` on an easy bin --
-                # 0.45 here against 0.9 on a hard one.
-                "ppo_gate_low": 0.5,
-                # How much the residual table modulates the gate, blended against
-                # all-ones: 1 = fully residual-driven, 0 = all-ones, i.e. the
-                # ungated scalar-``ppo_coef`` loss reproduced exactly. All-ones is
-                # also what the gate returns before the EMA warms up -- "no
-                # information yet" must mean *full* reward pressure, never none,
-                # since a gate reading ~0 everywhere is the pure-DAgger regime,
-                # which can lose a skill the policy already had.
-                "ppo_gate_adaptive": 1.0,
-                # Residual quantiles bracketing the ramp: bins at or below
-                # `_lo` sit at the floor, bins at or above `_hi` get full weight.
-                # Must be a ramp between two quantiles, not a division by one --
-                # with the hard phase a minority of bins, dividing by a single
-                # quantile saturates the whole table. Watch `Env/ppo_gate_spread`:
-                # it goes to 0 exactly when the table has stopped distinguishing
-                # phases, which `Loss/ppo_gate_mean` cannot tell you.
-                "ppo_gate_quantile_lo": 0.50,
-                "ppo_gate_quantile_hi": 0.95,
-                # EMA rate for the per-bin residual, matching
-                # AdaptiveTimestepSampler's adaptive_alpha. Slow on purpose:
-                # raising PPO where the residual is high changes the residual, so
-                # the loop needs a time constant well above one iteration.
-                "ppo_gate_ema_alpha": 0.001,
-                # Unmasked samples required before the residual table is used at
-                # all; until then the gate is all-ones. A cold EMA reads ~0
-                # everywhere, and acting on that is the pure-DAgger regime above.
-                "ppo_gate_warmup_samples": 5.0e5,
+                "motion_config": g1_distill_motion_config,
+                **WBT_DISTILL_GATE_PARAMS,
             },
         )
     },

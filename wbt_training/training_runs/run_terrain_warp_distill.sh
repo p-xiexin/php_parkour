@@ -8,6 +8,11 @@
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/setup_env.sh"
 php_launcher_init
+ROBOT="${ROBOT:-g1}"
+case "$ROBOT" in
+    g1|t2) ;;
+    *) php_error 'ROBOT must be g1 or t2'; exit 1 ;;
+esac
 REGISTRY="${REGISTRY:-auto}"
 NGPUS="${NGPUS:-2}"
 WARMUP_STEPS="${WARMUP_STEPS:-0}"
@@ -15,9 +20,9 @@ FINETUNE=$(php_boolean FINETUNE "${FINETUNE:-1}")
 php_positive_integer NGPUS "$NGPUS"
 [[ "$WARMUP_STEPS" =~ ^(0|[1-9][0-9]*)$ ]] || { php_error 'WARMUP_STEPS must be a nonnegative integer'; exit 1; }
 if [[ "$FINETUNE" == True ]]; then
-    EXP_PRESET=exp:g1-wbt-terrain-warp-distill-finetune
+    EXP_PRESET="exp:$ROBOT-wbt-terrain-warp-distill-finetune"
 else
-    EXP_PRESET=exp:g1-wbt-terrain-warp-distill
+    EXP_PRESET="exp:$ROBOT-wbt-terrain-warp-distill"
 fi
 php_prepare_inputs distill "${TEACHER_CHECKPOINT:-}"
 TEACHER_CHECKPOINT="$PHP_CHECKPOINTS"

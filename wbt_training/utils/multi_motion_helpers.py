@@ -44,12 +44,14 @@ def combine_motions(input_files: list[str | Path]) -> Path:
     # - joint_names / body_names: per-motion metadata, identical across files
     #   in the same registry. Converted holosoma NPZs ship these fields;
     #   ref artifact NPZs do not.
-    _SCALAR_KEYS = {"fps", "joint_names", "body_names"}
+    _SCALAR_KEYS = {"fps", "joint_names", "body_names", "robot_name", "root_body_name"}
 
     combined = {}
     for key in data_list[0]:
         if key in _SCALAR_KEYS:
             combined[key] = data_list[0][key]
+            if any(key not in d or not np.array_equal(d[key], combined[key]) for d in data_list[1:]):
+                raise ValueError(f"Cannot combine motions with different {key}")
         else:
             combined[key] = np.concatenate([d[key] for d in data_list], axis=0)
 

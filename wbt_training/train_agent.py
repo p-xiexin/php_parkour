@@ -1,4 +1,4 @@
-"""Train G1 29-DOF whole-body tracking agents.
+"""Train G1 or T2 whole-body tracking agents.
 
 Usage::
 
@@ -134,7 +134,7 @@ def _write_init_sentinel() -> None:
 
 
 def main() -> None:
-    """Launch training with G1 WBT presets."""
+    """Launch the selected robot's teacher or student preset."""
     os.environ.setdefault("LOGURU_LEVEL", "WARNING")
     _stagger_multi_gpu_init()
     tyro_cfg = tyro.cli(AnnotatedExperimentConfig, config=TYRO_CONIFG)

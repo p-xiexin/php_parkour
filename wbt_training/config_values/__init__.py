@@ -1,1 +1,1 @@
-"""Config presets for the G1 WBT training extension."""
+"""PHP training presets with G1 and T2 robot adaptations."""

@@ -1,0 +1,10 @@
+{
+  "inertialize_blending_halflife": 0.1,
+  "search_time": 0.1,
+  "simulation_velocity_halflife": 0.27,
+  "simulation_rotation_halflife": 0.27,
+  "output_fps": 50,
+  "transition_cost": 0.0,
+  "ignore_range_end": 20,
+  "ignore_surrounding": 20
+}

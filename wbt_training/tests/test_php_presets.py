@@ -1,5 +1,6 @@
 """CPU regression checks for the public PHP presets and checkpoint paths."""
 
+import os
 import subprocess
 import sys
 from dataclasses import asdict, replace
@@ -9,7 +10,6 @@ from textwrap import dedent
 import numpy as np
 import pytest
 import tyro
-from holosoma.config_types.experiment import ExperimentConfig
 from holosoma.config_values.logger import disabled, wandb
 from holosoma.config_values.robot import g1_29dof as core_g1_robot
 from holosoma.config_values.wbt.g1.experiment import g1_29dof_wbt
@@ -17,7 +17,7 @@ from holosoma.managers.utils import resolve_callable
 from holosoma.utils.helpers import get_class
 from holosoma.utils.tyro_utils import TYRO_CONIFG
 
-from wbt_training.config_values import experiment, robot_config
+from wbt_training.config_values import experiment, robot_config, t2_config
 
 PHP_PRESETS = (
     "g1_wbt_terrain_ref",
@@ -28,9 +28,14 @@ PHP_PRESETS = (
     "g1_wbt_terrain_no_heightscan_pelvis",
     "g1_wbt_terrain_warp_distill",
     "g1_wbt_terrain_warp_distill_finetune",
+    "t2_wbt_terrain_ref",
+    "t2_wbt_terrain_warp_distill",
+    "t2_wbt_terrain_warp_distill_finetune",
 )
 
 PHP_CHECKPOINT_PATHS = (
+    experiment.t2_wbt_terrain_ref.robot.control.implicit_actuator_builder,
+    "wbt_training.config_values.t2_training.T2RsD435iConfig",
     "wbt_training.config_values.robot_config:build_g1_implicit_actuators",
     "wbt_training.config_values.terrain:height_scan",
     "wbt_training.config_values.terrain:apply_terrain_preprocess",
@@ -161,23 +166,171 @@ def test_converter_works_with_only_numpy(tmp_path):
     assert result.returncode == 0, result.stderr
 
 
-def test_registry_contains_only_the_eight_php_presets():
+def test_registry_contains_all_php_presets():
     assert set(experiment.DEFAULTS) == set(PHP_PRESETS)
-    local_presets = {
-        name
-        for name, value in vars(experiment).items()
-        if isinstance(value, ExperimentConfig) and name.startswith("g1_wbt")
-    }
-    assert local_presets == set(PHP_PRESETS)
     assert experiment.g1_29dof_wbt is g1_29dof_wbt
+
+
+@pytest.mark.parametrize("lock_wrists", [False, True])
+def test_presets_do_not_parse_t2_assets(lock_wrists):
+    script = dedent("""
+        import os
+        import xml.etree.ElementTree as ET
+        from pathlib import Path
+        from unittest.mock import patch
+
+        import tyro
+        from holosoma.utils.tyro_utils import TYRO_CONIFG
+
+        original_parse = ET.parse
+        def without_t2(path, *args, **kwargs):
+            if Path(path).name == "t2_31dof_sphere_locked.xml":
+                raise FileNotFoundError("T2 assets are not installed")
+            return original_parse(path, *args, **kwargs)
+
+        with patch.object(ET, "parse", side_effect=without_t2):
+            from wbt_training.config_values.experiment import AnnotatedExperimentConfig
+            t2_dofs = 25 if os.environ["T2_LOCK_WRISTS"] == "1" else 31
+            for preset, dofs in (
+                ("g1-wbt-terrain-ref-noscale", 29),
+                ("g1-wbt-terrain-warp-distill-finetune", 29),
+                ("t2-wbt-terrain-ref", t2_dofs),
+                ("t2-wbt-terrain-warp-distill-finetune", t2_dofs),
+            ):
+                cfg = tyro.cli(
+                    AnnotatedExperimentConfig, args=["exp:" + preset], config=TYRO_CONIFG
+                )
+                assert cfg.robot.actions_dim == dofs
+    """)
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", script],
+        cwd=Path(__file__).resolve().parents[2], capture_output=True, text=True,
+        env={**os.environ, "T2_LOCK_WRISTS": str(int(lock_wrists))},
+    )
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("robot", [t2_config.t2_sphere_locked, t2_config.t2_sphere_unlocked])
+def test_t2_anatomy_and_wrist_action_space(robot):
+    from wbt_training.config_values.t2_training import T2RsD435iConfig
+
+    presets = {name: cfg for name, cfg in experiment.DEFAULTS.items() if name.startswith("t2_")}
+    for cfg in presets.values():
+        assert robot.actions_dim == robot.dof_obs_size == len(robot.dof_names)
+        assert robot.num_bodies == len(robot.body_names) == 48
+        assert sum("wrist" in name for name in robot.dof_names) == robot.actions_dim - 25
+        motion = cfg.command.setup_terms["motion_command"].params["motion_config"]
+        assert motion.motion_file == ""  # The registry supplies T2 data during preprocessing.
+        assert set(motion.body_names_to_track) <= set(robot.body_names)
+        assert motion.body_name_ref == ["trunk"]
+        assert "left_elbow_yaw_link" in motion.body_names_to_track
+        assert "left_elbow_pitch_link" not in motion.body_names_to_track
+        assert set(robot.init_state.default_joint_angles) == set(robot.dof_names)
+        for name in ("dof_pos_lower_limit_list", "dof_pos_upper_limit_list", "dof_vel_limit_list",
+                     "dof_effort_limit_list", "dof_armature_list", "dof_joint_friction_list"):
+            assert len(getattr(robot, name)) == robot.actions_dim
+    camera = T2RsD435iConfig()
+    assert set(camera.base_link_frame.values()) <= set(robot.body_names)
+    assert set(camera.ray_cast_bodies) <= set(robot.body_names)
+    assert {"left_hand_ee_link", "right_hand_ee_link"} <= set(camera.ray_cast_bodies)
+    depth = presets["t2_wbt_terrain_warp_distill"].observation.groups["depth_camera"].terms["depth_cam"]
+    assert depth.params["camera_sensor_cfg"] == "wbt_training.config_values.t2_training.T2RsD435iConfig"
+
+
+@pytest.mark.parametrize("lock_wrists", [False, True])
+def test_saved_t2_wrist_mode_survives_changed_default(tmp_path, lock_wrists):
+    import torch
+
+    robot = t2_config.t2_sphere_locked if lock_wrists else t2_config.t2_sphere_unlocked
+    cfg = replace(experiment.t2_wbt_terrain_ref, robot=robot)
+    path = tmp_path / "checkpoint.pt"
+    torch.save({"experiment_config": cfg.to_serializable_dict()}, path)
+    script = dedent("""
+        import sys
+        from dataclasses import asdict
+        from holosoma.utils.eval_utils import CheckpointConfig
+        from wbt_training.config_values import t2_config, experiment
+        from wbt_training.utils.checkpoint import load_saved_experiment_config
+
+        saved, _ = load_saved_experiment_config(CheckpointConfig(checkpoint=sys.argv[1]))
+        expected = t2_config.t2_sphere_locked if sys.argv[2] == "1" else t2_config.t2_sphere_unlocked
+        assert experiment.t2_wbt_terrain_ref.robot.actions_dim != expected.actions_dim
+        assert asdict(saved.robot) == asdict(expected)
+    """)
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", script, str(path), str(int(lock_wrists))],
+        env={**os.environ, "T2_LOCK_WRISTS": str(int(not lock_wrists))},
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_t2_registry_supplies_reference_motion(tmp_path, monkeypatch):
+    from wbt_training.config_values.terrain import apply_terrain_preprocess
+    from wbt_training.utils import multi_motion_helpers
+
+    bundle, scratch = tmp_path / "motions", tmp_path / "combined"
+    bundle.mkdir()
+    scratch.mkdir()
+    monkeypatch.setattr(multi_motion_helpers, "_TMP_DIR", scratch)
+    preset = experiment.t2_wbt_terrain_ref
+    joints, bodies = preset.robot.dof_names, preset.robot.body_names
+    np.savez(
+        bundle / "walk_motion.npz",
+        fps=np.array(50), joint_names=np.array(joints), body_names=np.array(bodies),
+        joint_pos=np.tile([0., 0., 1., 1., 0., 0., 0.] + [0.] * len(joints), (2, 1)),
+        joint_vel=np.zeros((2, len(joints) + 6)),
+        body_pos_w=np.zeros((2, len(bodies), 3)),
+        body_quat_w=np.tile([1., 0., 0., 0.], (2, len(bodies), 1)),
+        body_lin_vel_w=np.zeros((2, len(bodies), 3)),
+        body_ang_vel_w=np.zeros((2, len(bodies), 3)),
+    )
+    config = replace(
+        preset, logger=disabled,
+        training=replace(preset.training, registry_name=bundle.as_uri()),
+    )
+    processed = apply_terrain_preprocess(config, add_onpath_obstacle=False)
+    motion = processed.command.setup_terms["motion_command"].params["motion_config"]
+    with np.load(motion.motion_file) as data:
+        np.testing.assert_array_equal(data["joint_names"], joints)
+        assert data["joint_pos"].shape == (2, len(joints) + 7)
+    assert motion.body_name_ref == ["trunk"]
+
+
+def test_t2_preserves_default_php_training_recipe():
+    presets = experiment.DEFAULTS
+    for g1, t2 in (
+        (experiment.g1_wbt_terrain_ref_noscale, presets["t2_wbt_terrain_ref"]),
+        (experiment.g1_wbt_terrain_warp_distill, presets["t2_wbt_terrain_warp_distill"]),
+        (experiment.g1_wbt_terrain_warp_distill_finetune,
+         presets["t2_wbt_terrain_warp_distill_finetune"]),
+    ):
+        assert asdict(t2.algo) == asdict(g1.algo)
+        assert asdict(t2.curriculum) == asdict(g1.curriculum)
+        assert asdict(replace(t2.training, name=g1.training.name)) == asdict(g1.training)
+        g1_motion = g1.command.setup_terms["motion_command"].params["motion_config"]
+        t2_motion = t2.command.setup_terms["motion_command"].params["motion_config"]
+        assert asdict(t2_motion.noise_to_initial_pose) == asdict(g1_motion.noise_to_initial_pose)
+        if "teacher_obs" in t2.observation.groups:
+            g1_routing = g1.observation.groups["teacher_obs"].terms["which_motion"]
+            t2_routing = t2.observation.groups["teacher_obs"].terms["which_motion"]
+            expected_params = dict(g1_routing.params)
+            expected_params["bad_motion_body_pos_body_names"] = (
+                "left_ankle_roll_link", "right_ankle_roll_link",
+                "left_wrist_roll_link", "right_wrist_roll_link",
+            )
+            assert asdict(t2_routing) == asdict(replace(g1_routing, params=expected_params))
+            assert t2_routing.func.endswith(":which_motion")
+            assert set(t2_routing.params["bad_motion_body_pos_body_names"]) <= set(
+                t2_motion.body_names_to_track
+            )
 
 
 @pytest.mark.parametrize("name", PHP_PRESETS)
 def test_cli_selects_presets_with_wandb_logging_by_default(name):
     cfg = tyro.cli(
         experiment.AnnotatedExperimentConfig,
-        args=[f"exp:{name.replace('_', '-')}"],
-        config=TYRO_CONIFG,
+        args=[f"exp:{name.replace('_', '-')}"], config=TYRO_CONIFG,
     )
     assert cfg == experiment.DEFAULTS[name]
     assert cfg.logger == wandb
@@ -189,20 +342,24 @@ def test_cli_selects_presets_with_wandb_logging_by_default(name):
 def test_wandb_logging_can_be_disabled_explicitly(name):
     cfg = tyro.cli(
         experiment.AnnotatedExperimentConfig,
-        args=[f"exp:{name.replace('_', '-')}", "logger:disabled"],
-        config=TYRO_CONIFG,
+        args=[f"exp:{name.replace('_', '-')}", "logger:disabled"], config=TYRO_CONIFG,
     )
     assert cfg == replace(experiment.DEFAULTS[name], logger=disabled)
 
 
 def test_serialized_presets_use_the_supported_php_checkpoint_paths():
     paths = {
-        path for cfg in experiment.DEFAULTS.values() for path in _php_paths(asdict(cfg))
+        path for cfg in experiment.DEFAULTS.values()
+        for path in _php_paths(asdict(cfg))
     }
     assert paths == set(PHP_CHECKPOINT_PATHS)
 
 
-@pytest.mark.parametrize("path", PHP_CHECKPOINT_PATHS)
+@pytest.mark.parametrize("path", PHP_CHECKPOINT_PATHS + (
+    "wbt_training.config_values.motion_command:motion_expert_index",  # Old T2 checkpoints.
+    "wbt_training.config_values.t2_config:build_t2_implicit_actuators",
+    "wbt_training.config_values.t2_config:build_t2_unlocked_implicit_actuators",
+))
 def test_supported_checkpoint_paths_resolve(path):
     # Use the same resolvers as manager terms and algorithm construction.
     resolved = resolve_callable(path) if ":" in path else get_class(path)

@@ -100,7 +100,7 @@ HOLD 使用相同的 `climbing` 命令，将 `--data-format` 改为 `hold`、输
 | Holosoma 重定向 NPZ | `qpos: (T,38)`，`[root_xyz, root_quat_wxyz, joint31]`，另有 `fps` | 读取文件中的 `fps` |
 | PHP 内部 qpos | `(T,38)`，`[root_quat_wxyz, root_xyz, joint31]` | 由调用方提供 |
 | PHP 数据库 BIN | Simulation 骨骼、机器人骨架、速度、接触状态和原始/镜像范围 | 60 Hz |
-| T2 tracking NPZ | 31 个关节与 48 个身体的状态及名称，合成时可附带 `vel_cmd` | 默认合成导出 50 Hz |
+| T2 tracking NPZ | 31 个关节与 48 个身体的状态及名称，合成时可附带 `vel_cmd` | GMR＋SQP 数据链路保持 60 Hz |
 
 `RobotSpec.from_mujoco_qpos()` 与 `to_mujoco_qpos()` 负责两种 qpos 布局互转。
 `RobotSpec.encode_qpos_to_bones()` 与 `decode_bones_to_qpos()` 完成关节和匹配骨架互转；解码时移除静态绑定旋转，并按实际关节轴恢复角度。`mirror_qpos()` 根据左右关节与轴方向生成镜像。
@@ -122,49 +122,27 @@ python -m motion_matching.generate_t2_database \
 源文件、源帧率及范围。镜像依据 T2 实际关节轴与左右对应关系完成。
 构库的 cubic 重采样、Simulation 骨骼平滑、速度和接触计算沿用上游 PHP 规则。
 
-## 移动合成接口
+## 从 database 生成训练动作
 
-`MotionMatchingSystem` 通过 `robot_spec`、`registry` 和 `database_dir` 接入 T2。
-例如，加载刚构建的移动库：
+`configs/g1.json`、`configs/t2.json` 分别保存匹配参数，由 `--robot` 选择。
+新增的接触映射、SQP 优化和物理验收统一放在 `motion_matching/postprocessing/`。
+T2 在 motion matching 完成后，以惯性拼接为初值执行约束后处理，输出 60 Hz tracking NPZ。
 
-```python
-from motion_matching.robots import get_robot_spec
-from motion_matching.run import MotionMatchingSystem
-
-spec = get_robot_spec("t2")
-registry = {
-    "locomotion": {
-        "bin": "database_t2_locomotion.bin",
-        "features": "features_t2_locomotion.pkl",
-        "search_ranges": None,
-    }
-}
-system = MotionMatchingSystem(
-    robot_spec=spec, registry=registry, database_dir="/path/to/bank"
-)
+```bash
+# 在独立的重定向环境中运行
+python -m pip install -r retargeting/requirements.txt trimesh==4.5.1
+export PYTHONPATH="$PWD:$PWD/motion_matching${PYTHONPATH:+:$PYTHONPATH}"
+python -m motion_matching.run --mode generate --robot t2 \
+  --database-dir /path/to/t2/databases \
+  --scenario low_speed_step --output-dir /path/to/t2/training_motions \
+  --jobs 1
 ```
 
-特征使用 T2 的骨盆和双脚索引；检索、停止、惯性化和 anchor 逻辑沿用官方实现。
-保存时向 `save_motion_npz()` 传入同一 `robot_spec`，输出 T2 tracking 格式：
-`joint_pos`、`joint_vel`、`body_pos_w`、`body_quat_w`、`body_lin_vel_w`、
-`body_ang_vel_w`、`fps`，以及 `joint_names`、`body_names`、`robot_name` 和 `root_body_name`。
+首次运行从相邻的 `<bank>_work/` 提取接触阶段与优化后的锚点，保存到 `<bank>_contacts/`；已有接触包可通过 `--contact-bundle-dir` 指定。`--model` 可指定模型；`--config` 可覆盖所选机器人的数值参数，通常无需指定。
 
-`generate_segment()` 可生成移动片段，保存时应将方向指令与动作重采样到相同帧率：
+每个场景输出 `*_motion.npz`、`*_terrain.obj` 和 `*_terrain.npy`。NPZ 保留关节/身体名称、根节点名称、状态、速度和 `vel_cmd`；T2 地形变体使用求解时的参考场景。
 
-```python
-from motion_matching.io import save_motion_npz
-from motion_matching.run import generate_segment
-from motion_matching.utils.data_utils import resample_vel_cmd
-
-qpos, commands = generate_segment(
-    system, speed=0.8, turn_angle_degrees=0.0, duration_s=5.0, vel_cmd_idx=1
-)
-save_motion_npz(
-    qpos, "t2_motion.npz", source_fps=60, target_fps=50,
-    vel_cmd=resample_vel_cmd(commands, required_fps=50, original_fps=60),
-    robot_spec=spec,
-)
-```
+G1 保持原有惯性拼接、50 Hz 输出和地形随机化。搜索帧区间统一读取 database 的 `registry.json`；新建 T2 bank 会写入已验证的区间。旧 T2 bank 的 `climb_76_down.search_ranges` 应为 `[[515,521,645],[1189,1195,1319]]`，请在数据副本中更新，不要修改训练中的 bank。历史人体重定向、`build_native_database()`、`MotionMatchingSystem` 与 `generate_segment()` 的 Python 接口继续保留。
 
 ## 可视化
 
@@ -183,10 +161,9 @@ python -m motion_matching.motion_visualizer \
 
 重定向 NPZ、BIN 中的原始/镜像范围，以及合成后的 tracking NPZ 是不同阶段的输出。
 
-上游 `motion_matching.run` 命令行、`play_database` 及训练入口仍使用 G1 配置；
-T2 移动合成使用上述 Python 接口。
+`motion_matching.run --mode generate --robot t2` 使用 T2 数据配置；训练与 Isaac 适配见 [wbt_training](wbt_training/README.md#t2)。
 
-适配不增加额外的时序平滑、足底接触或重心修正；上游算法自带的平滑与约束保持。
+T2 拼接保留已验证的目标函数、接触约束和参数，不增加关节裁剪、抬高或事后平滑。
 
 ## 必要兼容修改
 

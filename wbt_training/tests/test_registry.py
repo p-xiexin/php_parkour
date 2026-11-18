@@ -114,8 +114,8 @@ def write_native(path, value=1, *, frames=3):
     path.parent.mkdir(parents=True, exist_ok=True)
     data = {
         "fps": np.array([50]),
-        "joint_pos": np.full((frames, 2), value, dtype=np.float32),
-        "joint_vel": np.zeros((frames, 2), dtype=np.float32),
+        "joint_pos": np.full((frames, 9), value, dtype=np.float32),
+        "joint_vel": np.zeros((frames, 8), dtype=np.float32),
         "body_pos_w": np.tile([[[value, 0, 0.7]]], (frames, 1, 1)),
         "body_quat_w": np.tile([[[1, 0, 0, 0]]], (frames, 1, 1)),
         "body_lin_vel_w": np.zeros((frames, 1, 3)),

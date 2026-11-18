@@ -1,0 +1,121 @@
+diff --git a/src/holosoma/holosoma/envs/wbt/wbt_manager.py b/src/holosoma/holosoma/envs/wbt/wbt_manager.py
+index 2c34cf4..713f711 100644
+--- a/src/holosoma/holosoma/envs/wbt/wbt_manager.py
++++ b/src/holosoma/holosoma/envs/wbt/wbt_manager.py
+@@ -53,6 +53,12 @@ class WholeBodyTrackingManager(BaseTask):
+     def _pre_compute_observations_callback(self):
+         self.base_quat[:] = self.simulator.base_quat[:]
+
++    def _update_tasks_callback(self):
++        super()._update_tasks_callback()
++        # MotionCommand may reset a source clip and refresh simulator tensors
++        # without an episode reset. Observations must use that new root frame.
++        self._pre_compute_observations_callback()
++
+     def _reset_buffers_callback(self, env_ids, target_buf=None):
+         self.need_to_refresh_envs[env_ids] = True
+         self.episode_length_buf[env_ids] = 0
+diff --git a/src/holosoma/holosoma/managers/observation/terms/depth.py b/src/holosoma/holosoma/managers/observation/terms/depth.py
+index 9364adf..9a88e8e 100644
+--- a/src/holosoma/holosoma/managers/observation/terms/depth.py
++++ b/src/holosoma/holosoma/managers/observation/terms/depth.py
+@@ -91,14 +91,13 @@ class WarpDepthImageObsTerm(ObservationTermBase):
+         else:
+             assert self.latency_frame < self.buffer_len, "Latency frame must be less than buffer length"
+
+         # NOTE: command_manager is constructed *after* observation_manager in
+         # BaseTask.__init__, so we cannot resolve the motion command here. Defer
+-        # the lookup and the previous-timestep buffer to the first __call__.
++        # the lookup to the first __call__.
+         self._command_name: str = params["command_name"]
+         self.command: Any = None
+-        self._prev_time_step: torch.Tensor | None = None
+
+         self._init_camera(cfg, env)
+
+         # Perlin hole generator — generate at 64x96 then interp to (H, W) to
+         # keep perlin periodicity independent of the CNN resolution.
+@@ -195,11 +194,10 @@ class WarpDepthImageObsTerm(ObservationTermBase):
+         if self.command is None:
+             raise ValueError(
+                 f"WarpDepthImageObsTerm requires a stateful command "
+                 f"'{self._command_name}'; got None from command_manager.get_state()."
+             )
+-        self._prev_time_step = self.command.time_steps.clone()
+
+     def __call__(self, env: Any, *, modify_history: bool = True, **kwargs: Any) -> torch.Tensor:
+         if not modify_history:
+             return self._cached_output.to(env.device)
+
+@@ -207,15 +205,12 @@ class WarpDepthImageObsTerm(ObservationTermBase):
+         depth_images = self._get_depth_images(env)
+         processed_images = self._process_depth_images(depth_images, env_ids=slice(None))
+         self.depth_buffer[:, :-1] = self.depth_buffer[:, 1:].clone()
+         self.depth_buffer[:, -1] = processed_images.to(self.device)
+
+-        # Preserve the compatibility branch's backward-timestep reset detection.
+-        time_step_now = self.command.time_steps
+-        motion_end_reset = time_step_now < self._prev_time_step
+-        self._prev_time_step = time_step_now.clone()
+-        reset_idxs = motion_end_reset | self.reset_episodes
++        # Both episode and clip resets invalidate depth history after teleporting.
++        reset_idxs = self.reset_episodes | self.command.motion_end_reset
+         if reset_idxs.any():
+             # Fill every buffer slot of a resetting env with the current frame.
+             # The source is expanded to the destination shape explicitly rather
+             # than relying on broadcast: under
+             # ``torch.use_deterministic_algorithms(True)`` boolean-mask
+diff --git a/src/holosoma/holosoma/managers/observation/tests/test_stateful_history_control.py b/src/holosoma/holosoma/managers/observation/tests/test_stateful_history_control.py
+index 945ddcc..b9d4114 100644
+--- a/src/holosoma/holosoma/managers/observation/tests/test_stateful_history_control.py
++++ b/src/holosoma/holosoma/managers/observation/tests/test_stateful_history_control.py
+@@ -120,11 +120,10 @@ def _depth_term_for_buffer_test(*, latency_frame: int | tuple[int, int]) -> tupl
+     term._cached_output = torch.zeros(2, 1, 2)
+     term.reset_episodes = torch.tensor([False, True])
+     term.command = types.SimpleNamespace(
+         time_steps=torch.tensor([2, 4]), motion_end_reset=torch.tensor([False, False])
+     )
+-    term._prev_time_step = term.command.time_steps.clone()
+     term._ensure_command_resolved = lambda env: None  # type: ignore[method-assign]  # noqa: ARG005
+     frame = torch.tensor([[[1.0, 2.0]], [[3.0, 4.0]]])
+     term._get_depth_images = lambda env: frame  # type: ignore[method-assign]  # noqa: ARG005
+     # `env_ids` must keep its name: the term passes it as a keyword argument.
+     term._process_depth_images = lambda depth_images, env_ids=None: depth_images  # type: ignore[method-assign]  # noqa: ARG005
+@@ -221,33 +220,19 @@ def test_empty_reset_after_reset_all_clears_pending_flush_like_compat() -> None:
+     assert torch.equal(output, torch.full_like(frame, -1.0))
+     assert torch.equal(term.depth_buffer[:, -1], frame)
+     assert not term.reset_episodes.any()
+
+
+-def test_forward_motion_resample_keeps_history_like_compat() -> None:
++@pytest.mark.parametrize("next_frame", [1, 4, 8])
++def test_motion_resample_refills_depth_buffer_regardless_of_frame_index(next_frame: int) -> None:
+     term, frame = _depth_term_for_buffer_test(latency_frame=1)
+     env = types.SimpleNamespace(device="cpu")
+     term.reset_episodes[:] = False
+     term.depth_buffer[:] = -1.0
+-    # Env 1 hit a clip end in MotionCommand.step() and was resampled to a later
+-    # frame (time step increased); reset() is not called on this path.
++    # Clip resampling need not move the frame index backward or end the episode.
+     term.command.motion_end_reset = torch.tensor([False, True])
+-    term.command.time_steps = torch.tensor([3, 8])
+-
+-    output = term(env, modify_history=True)
+-
+-    assert torch.equal(output, torch.full_like(frame, -1.0))
+-    assert torch.equal(term.depth_buffer[:, -1], frame)
+-    assert torch.equal(term._prev_time_step, term.command.time_steps)
+-
+-
+-def test_backward_motion_resample_refills_depth_buffer_like_compat() -> None:
+-    term, frame = _depth_term_for_buffer_test(latency_frame=1)
+-    env = types.SimpleNamespace(device="cpu")
+-    term.reset_episodes[:] = False
+-    term.depth_buffer[:] = -1.0
+-    term.command.time_steps = torch.tensor([3, 1])
++    term.command.time_steps = torch.tensor([3, next_frame])
+
+     output = term(env, modify_history=True)
+
+     assert torch.equal(output[0], torch.full_like(frame[0], -1.0))
+     assert all(torch.equal(term.depth_buffer[1, i], frame[1]) for i in range(term.buffer_len))

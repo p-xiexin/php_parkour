@@ -26,15 +26,14 @@ from typing import Any
 
 import numpy as np
 import torch
-
 from holosoma.managers.command.terms.wbt import MotionCommand
 from holosoma.managers.observation.terms.wbt import gravity_vector
-from holosoma.utils.rotations import quat_rotate_inverse as _quat_rotate_inverse
 from holosoma.utils.rotations import (
     get_euler_xyz,
     quat_from_euler_xyz,
     quat_mul,
 )
+from holosoma.utils.rotations import quat_rotate_inverse as _quat_rotate_inverse
 
 
 class PhpMotionCommand(MotionCommand):
@@ -693,6 +692,16 @@ def velocity_command(env: Any) -> "torch.Tensor":
 # ---------------------------------------------------------------------------
 # Teacher-routing observation
 # ---------------------------------------------------------------------------
+
+
+def motion_expert_index(env: Any) -> "torch.Tensor":
+    """Compatibility routing for previously saved T2 experiment configs.
+
+    New training presets inherit ``which_motion`` and PHP's expert-validity mask.
+    Keep this ungated function importable so existing checkpoints remain replayable.
+    """
+    cmd = env.command_manager.get_state("motion_command")
+    return cmd.motion.motion_idxs[cmd.time_steps].to(torch.float32).view(env.num_envs, 1)
 
 
 def which_motion(

@@ -23,4 +23,4 @@ test = ["pytest"]
 include = ["wbt_training*"]
 
 [tool.setuptools.package-data]
-wbt_training = ["training_runs/*.sh"]
+wbt_training = ["training_runs/*.sh", "*.patch"]

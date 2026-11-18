@@ -57,6 +57,7 @@ def export_fixture():
         d_gains=torch.tensor([1.0, 2.0]),
     )
     env = SimpleNamespace(
+        dt=1. / 60.,
         command_manager=SimpleNamespace(
             get_state=lambda _: command,
             cfg=SimpleNamespace(setup_terms={"motion_command": None}),
@@ -92,6 +93,46 @@ def export_fixture():
         depth_backbone=DepthOnlyFCBackbone58x87Small(32),
     )
     return env, policy, motion
+
+
+
+@pytest.mark.parametrize("joint_keys", [("left", "right"), ("left_joint", "right_joint")])
+def test_implicit_actuator_metadata_resolves_joint_gains(joint_keys):
+    env, _, _ = export_fixture()
+    action = env.action_manager.get_term("joint_control")
+    del action.p_gains, action.d_gains
+    env.robot_config.control = SimpleNamespace(
+        stiffness=dict(zip(joint_keys, (77., 88.))),
+        damping=dict(zip(joint_keys, (3., 4.))),
+    )
+    metadata = exporter.build_metadata_from_wbt_env(env)
+    assert metadata["kp"] == [77., 88.]
+    assert metadata["kd"] == [3., 4.]
+    assert metadata["control_dt"] == env.dt
+
+
+@pytest.mark.parametrize("lock_wrists", [False, True])
+def test_t2_metadata_matches_wrist_mode(lock_wrists):
+    from wbt_training.config_values.t2_config import (
+        t2_sphere_locked,
+        t2_sphere_unlocked,
+    )
+
+    robot = t2_sphere_locked if lock_wrists else t2_sphere_unlocked
+    env, _, _ = export_fixture()
+    action = env.action_manager.get_term("joint_control")
+    del action.p_gains, action.d_gains
+    action.action_scales = torch.ones(robot.actions_dim)
+    env.robot_config = robot
+    env.default_dof_pos_base = torch.tensor([
+        robot.init_state.default_joint_angles[name] for name in robot.dof_names
+    ])
+    metadata = exporter.build_metadata_from_wbt_env(env)
+    assert metadata["joint_names"] == robot.dof_names
+    for key in ("action_scale", "default_joint_pos", "kp", "kd"):
+        assert len(metadata[key]) == (25 if lock_wrists else 31)
+    assert metadata["kp"] == [robot.control.stiffness[name] for name in robot.dof_names]
+    assert metadata["kd"] == [robot.control.damping[name] for name in robot.dof_names]
 
 
 def test_depth_bundle_contract_metadata_and_onnx_numerics(tmp_path):

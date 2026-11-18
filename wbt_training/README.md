@@ -2,11 +2,55 @@
 
 [Project overview](../README.md)
 
-Train G1 terrain teachers and distill them into a RealSense D435i depth student.
+Train G1 or T2 terrain teachers and distill them into a RealSense D435i depth student.
 Training and checkpoint evaluation require Linux/NVIDIA with IsaacSim.
 For sim2sim with the exported ONNX policy in MuJoCo, see the [sim2sim guide](DEPLOY.md).
 
 Run all commands below from the PHP checkout root.
+
+## T2
+
+G1 and T2 share the PHP teacher and student recipes. T2 uses spherical hand
+ends and defaults to 31 actuated joints with movable wrists. Set
+`T2_LOCK_WRISTS=1` for the 25-joint fixed-wrist variant. The student launcher defaults to
+distillation + PPO (`FINETUNE=1`). Training reads motion NPZ and terrain files.
+
+After environment setup, generate the URDF, MJCF and camera meshes once:
+
+```bash
+export T2_LOCK_WRISTS=0  # Default; use 1 for fixed wrists in assets and new training runs.
+python -m wbt_training.training_runs.t2_asset
+```
+
+Training imports the generated URDF through IsaacLab's standard importer.
+The two variants use `t2_sphere_unlocked.urdf/xml` and `t2_sphere_locked.urdf/xml`.
+Set `PHP_T2_ASSET_DIR` when using another asset directory. Convert matching outputs with
+`python -m wbt_training.training_runs.motion_convert INPUT OUTPUT --robot t2`,
+and keep their paired terrain files alongside the converted motions.
+The converter defaults to G1; T2 keeps all 31 motion joint columns, and training
+selects its 25 or 31 actuated joints by name. Existing reference motions keep
+their zero wrist targets in either mode.
+
+```bash
+ROBOT=t2 REGISTRY=file:///path/to/t2/training_motions \
+  bash wbt_training/training_runs/run_terrain_teacher.sh
+
+ROBOT=t2 REGISTRY=file:///path/to/skill_a,file:///path/to/skill_b \
+  TEACHER_CHECKPOINT=/path/to/teacher_a.pt,/path/to/teacher_b.pt \
+  bash wbt_training/training_runs/run_terrain_warp_distill.sh
+```
+
+Teacher checkpoints must match the student's wrist mode. When resuming training,
+set `T2_LOCK_WRISTS` to match the checkpoint (`1` for 25 joints, `0` for 31);
+a mismatch fails during weight loading. Evaluation and ONNX export restore the
+saved robot configuration independently of `T2_LOCK_WRISTS`.
+
+`config_values/t2_config.py` defines the robot; `config_values/t2_training.py`
+contains its camera and training-manager settings. `config_values/experiment.py`
+combines each robot's settings with the shared training recipe.
+Setup applies `holosoma_training.patch` for root-state and depth-history
+refresh after motion resets. Existing environments can apply it once with
+`git -C thirdparty/holosoma apply ../../wbt_training/holosoma_training.patch`.
 
 ## Setup
 

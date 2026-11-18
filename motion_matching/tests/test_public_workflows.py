@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -115,3 +116,114 @@ def test_swap_xy_helper_swaps_geometry_without_gui_imports(tmp_path):
     rotation = trimesh.transformations.quaternion_matrix(data["quat"])[:3, :3]
     local_vertices = (mesh.vertices[:, [1, 0, 2]] - data["pos"]) @ rotation
     np.testing.assert_allclose(np.abs(local_vertices), np.broadcast_to(np.asarray(data["size"]) / 2, (8, 3)), atol=1e-7)
+
+
+def test_contact_face_binding_uses_overlapping_support():
+    from motion_matching.postprocessing.contacts import _bind, _surfaces
+
+    from retargeting.retarget_contacts import ContactPhase
+
+    phase = ContactPhase(
+        body=1,
+        local_point=np.zeros(3),
+        start=0,
+        stop=4,
+        anchor=np.array([0.0, 0.0, 1.0]),
+        normal=np.array([0.0, 0.0, 1.0]),
+        plane_height=1.0,
+        tangent_axes=np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]),
+        tangent_lower=np.array([0.0, -0.2]),
+        tangent_upper=np.array([0.6, 0.2]),
+    )
+    near = dict(pos=[-0.07, 0.0, 0.5], quat=[1.0, 0.0, 0.0, 0.0], size=[0.1, 0.4, 1.0])
+    support = dict(pos=[0.3, 0.0, 0.5], quat=[1.0, 0.0, 0.0, 0.0], size=[0.2, 0.4, 1.0])
+    # The closer box is outside the source patch. Adding it cannot invalidate
+    # the farther box whose top face intersects the patch.
+    for boxes in ([support], [near, support], [support, near]):
+        _, bound = _bind(phase, _surfaces(boxes))
+        np.testing.assert_allclose(bound.tangent_lower, [0.2, -0.2], atol=1e-12)
+        np.testing.assert_allclose(bound.tangent_upper, [0.4, 0.2], atol=1e-12)
+        np.testing.assert_array_equal(bound.anchor, phase.anchor)
+    with pytest.raises(ValueError, match="overlap"):
+        _bind(phase, _surfaces([near]))
+
+
+def test_t2_retarget_contacts_to_training_npz(tmp_path):
+    """Use real consolidated retarget results through contact export and solving."""
+    source = os.environ.get("T2_BANK_DIR")
+    if not source:
+        pytest.skip("Set T2_BANK_DIR to a retargeted bank containing jump_35")
+    import mujoco as mj
+    from motion_matching.core.database import MotionMatchingDatabase
+    from motion_matching.io import save_motion_npz
+    from motion_matching.postprocessing.contacts import (
+        BankContactSource,
+        export_contact_bundle,
+    )
+    from motion_matching.postprocessing.solver import generate_transition
+    from motion_matching.postprocessing.validation import MotionConstraintVerifier
+    from motion_matching.robots.t2 import make_t2_spec
+
+    bank = Path(source)
+    work = bank.with_name(bank.name + "_work")
+    spec = make_t2_spec(PKG_ROOT / "assets/robots/booster_t2/mjcf/t2_31dof_sphere_locked.xml")
+    bundle = tmp_path / "contacts"
+    export_contact_bundle(bank, work, spec, bundle)
+    name = "database_g1_jump_35.bin"
+    db = MotionMatchingDatabase()
+    db.load_from_file(str(bank / name))
+    start, stop = map(int, (db.range_starts[0], db.range_stops[0]))
+    assert stop - start == 34
+    records = [dict(db_key="jump_35", source_frame=frame,
+                    transform_quat=[1, 0, 0, 0], transform_pos=[0, 0, 0])
+               for frame in range(start, stop)]
+    scene = mj.MjModel.from_xml_path(str(work / Path(name).stem / "range_00/scene.xml"))
+    box = scene.geom("scene_box")
+    boxes = [dict(pos=box.pos.tolist(), quat=box.quat.tolist(), size=(2*box.size).tolist())]
+    contacts = BankContactSource(bank, bundle, spec).build(records, boxes)
+    expected = spec.decode_bones_to_qpos(db.bone_positions[start:stop], db.bone_rotations[start:stop])
+    np.testing.assert_allclose(contacts.target_qpos[:, 4:], expected[:, 4:], atol=1e-12)
+    saved_phases = json.loads((work / Path(name).stem / "range_00/phases.json").read_text())
+    with np.load(work / Path(name).stem / "range_00/trajectory.npz") as saved:
+        payload = json.loads((bundle / "database_g1_jump_35.contacts.json").read_text())
+        exported = payload["ranges"][0]["phases"]
+        assert len(exported) == len(saved_phases)
+        np.testing.assert_array_equal([p["anchor"] for p in exported], saved["anchors"])
+    target = contacts.target_qpos
+    fixed = {frame: target[frame].copy() for frame in (0, 1, len(target)-2, len(target)-1)}
+    qpos = generate_transition(spec, boxes, target, phases=contacts.phases,
+                               fixed_poses=fixed, fixed_anchors=contacts.fixed_anchors,
+                               iterations=80)
+    output = tmp_path / "jump_motion.npz"
+    save_motion_npz(qpos, output, target_fps=60, source_fps=60, robot_spec=spec)
+    verifier = MotionConstraintVerifier(spec, boxes)
+    assert not verifier.check_npz(output)
+    # Removing redundant input checks must not weaken physical acceptance.
+    bad = qpos[:2].copy()
+    bad[:, 6] -= 0.1
+    assert "collision_penetration" in verifier.check(bad, 60)
+    bad = qpos[:2].copy()
+    bad[0, 7] = spec.model.jnt_range[spec.joint_ids[0], 1] + 0.01
+    assert "hard_joint_limits" in verifier.check(bad, 60)
+    bad = qpos[:2].copy()
+    bad[0, 7 + verifier.wrist_columns[0]] = 0.01
+    assert "locked_wrist_angle" in verifier.check(bad, 60)
+    for frame, pose in fixed.items():
+        np.testing.assert_allclose(qpos[frame], pose, atol=1e-12)
+
+    with np.load(output) as saved:
+        arrays = {key: saved[key] for key in saved.files}
+    foot = spec.body_names.index("left_ankle_pitch_link")
+    edited = tmp_path / "edited_motion.npz"
+    positions = arrays["body_pos_w"].copy()
+    positions[:, foot, 2] = -1.0
+    np.savez(edited, **{**arrays, "body_pos_w": positions})
+    assert "body_position_mismatch" in verifier.check_npz(edited)
+
+    rotations = arrays["body_quat_w"].copy()
+    rotations[0, foot] = [0.0, 1.0, 0.0, 0.0]
+    np.savez(edited, **{**arrays, "body_quat_w": rotations})
+    assert "body_rotation_mismatch" in verifier.check_npz(edited)
+    # q and -q encode the same rotation, including at the floating root.
+    np.savez(edited, **{**arrays, "body_quat_w": -arrays["body_quat_w"]})
+    assert not verifier.check_npz(edited)

@@ -1,7 +1,7 @@
 """PHP terrain teacher and depth-distillation experiment presets.
 
-The teacher derives from Holosoma's G1 whole-body-tracking experiment;
-terrain variants and students preserve their existing replace chains.
+G1 and T2 combine their own robot and manager settings with shared PHP
+teacher, distillation and PPO training settings.
 W&B logging is enabled by default; use ``logger:disabled`` for local-only output.
 """
 
@@ -20,8 +20,12 @@ from holosoma.config_types.algo import (
     OptimizerConfig,
     StudentTeacherModuleConfig,
 )
-from holosoma.config_types.experiment import ExperimentConfig
-from holosoma.config_values import simulator
+from holosoma.config_types.experiment import (
+    ExperimentConfig,
+    NightlyConfig,
+    TrainingConfig,
+)
+from holosoma.config_values import algo, scene, simulator, terrain
 from holosoma.config_values.logger import wandb as wandb_logger
 from holosoma.config_values.wbt.g1.experiment import g1_29dof_wbt
 
@@ -30,43 +34,55 @@ from wbt_training.config_values.depth_distillation import (
     g1_29dof_wbt_terrain_distill_curriculum,
     g1_29dof_wbt_terrain_distill_observation,
 )
+from wbt_training.config_values.t2_config import t2_robot
+from wbt_training.config_values.t2_training import (
+    t2_distill_command,
+    t2_distill_curriculum,
+    t2_distill_observation,
+    t2_terrain_command,
+    t2_terrain_reward,
+    t2_terrain_termination,
+)
 from wbt_training.config_values.terrain import (
-    g1_29dof_joint_pos_implicit,
     g1_29dof_wbt_terrain_command,
     g1_29dof_wbt_terrain_command_pelvis,
-    g1_29dof_wbt_terrain_observation,
-    g1_29dof_wbt_terrain_observation_no_heightscan,
-    g1_29dof_wbt_terrain_randomization,
     g1_29dof_wbt_terrain_reward,
     g1_29dof_wbt_terrain_termination,
+    wbt_joint_pos_implicit,
+    wbt_terrain_curriculum,
+    wbt_terrain_observation,
+    wbt_terrain_observation_no_heightscan,
+    wbt_terrain_randomization,
 )
 
-# ---------------------------------------------------------------------------
-# Terrain presets. Start from the stock `g1_29dof_wbt` base (ref-matching);
-# terrain-specific command/observation/reward/termination presets live in
-# `wbt_training.config_values.terrain`.
-# ---------------------------------------------------------------------------
+# Common PHP settings contain no robot, tracked bodies or camera selection.
 _ref_adamw_no_wd = OptimizerConfig(_target_="torch.optim.AdamW", weight_decay=0.0)
-
-g1_wbt_terrain_ref = replace(
-    g1_29dof_wbt,
-    training=replace(
-        g1_29dof_wbt.training,
-        project="WBT-Holosoma",
-        name="g1_29dof_wbt_terrain_manager",
-        num_envs=4096,
-        # Application-specific preprocess: resolves training.registry_name via
-        # wandb (or file://), samples per-env on-path obstacles, splices the
-        # combined terrain OBJ + motion NPZ into the config before env build.
-        preprocess_hook="wbt_training.config_values.terrain:apply_terrain_preprocess",
-        preprocess_hook_kwargs=json.dumps(
-            {
-                "add_onpath_obstacle": True,
-                # Many envs share each of the 64 obstacle layouts.
-                "num_variants": 64,
-            }
-        ),
+_teacher_algo = replace(
+    algo.ppo,
+    config=replace(
+        algo.ppo.config,
+        actor_learning_rate=1e-3,
+        critic_learning_rate=1e-3,
+        num_learning_epochs=5,
+        num_learning_iterations=20000,
+        save_interval=500,
+        entropy_coef=0.005,
+        init_noise_std=1.0,
+        init_at_random_ep_len=False,
+        use_symmetry=False,
+        empirical_normalization=False,
+        actor_optimizer=_ref_adamw_no_wd,
+        critic_optimizer=_ref_adamw_no_wd,
     ),
+)
+_teacher_training = TrainingConfig(
+    project="WBT-Holosoma",
+    num_envs=4096,
+    preprocess_hook="wbt_training.config_values.terrain:apply_terrain_preprocess",
+    preprocess_hook_kwargs=json.dumps({"add_onpath_obstacle": True, "num_variants": 64}),
+)
+_terrain_settings = dict(
+    env_class="holosoma.envs.wbt.wbt_manager.WholeBodyTrackingManager",
     logger=wandb_logger,
     simulator=replace(
         simulator.isaacsim,
@@ -75,28 +91,28 @@ g1_wbt_terrain_ref = replace(
             sim=replace(simulator.isaacsim.config.sim, max_episode_length_s=10.0),
         ),
     ),
-    # `scene` was promoted from `simulator.config.scene` to a top-level
-    # ExperimentConfig field in holosoma (scene/sensor/plugin extraction).
-    scene=replace(g1_29dof_wbt.scene, env_spacing=0.0),
-    # g1_29dof_wbt base already has actor/critic hidden_dims=[512,256,128] — no module override needed.
-    algo=replace(
-        g1_29dof_wbt.algo,
-        config=replace(
-            g1_29dof_wbt.algo.config,
-            actor_learning_rate=1e-3,
-            critic_learning_rate=1e-3,
-            num_learning_epochs=5,
-            num_learning_iterations=20000,
-            save_interval=500,
-            entropy_coef=0.005,
-            init_noise_std=1.0,
-            init_at_random_ep_len=False,
-            use_symmetry=False,
-            empirical_normalization=False,
-            actor_optimizer=_ref_adamw_no_wd,
-            critic_optimizer=_ref_adamw_no_wd,
-        ),
+    scene=replace(scene.empty, env_spacing=0.0),
+    terrain=terrain.terrain_locomotion_plane,
+    nightly=NightlyConfig(
+        iterations=8000,
+        metrics={
+            "Episode/rew_motion_global_ref_position_error_exp": [0.3, "inf"],
+            "Episode/rew_motion_global_ref_orientation_error_exp": [0.4, "inf"],
+            "Episode/rew_motion_relative_body_position_error_exp": [0.85, "inf"],
+            "Episode/rew_motion_relative_body_orientation_error_exp": [0.7, "inf"],
+            "Episode/rew_motion_global_body_lin_vel": [0.60, "inf"],
+            "Episode/rew_motion_global_body_ang_vel": [0.45, "inf"],
+        },
     ),
+)
+
+g1_wbt_terrain_ref = replace(
+    g1_29dof_wbt,
+    logger=wandb_logger,
+    simulator=_terrain_settings["simulator"],
+    scene=_terrain_settings["scene"],
+    training=replace(_teacher_training, name="g1_29dof_wbt_terrain_manager"),
+    algo=_teacher_algo,
     robot=replace(
         g1_29dof_wbt.robot,
         control=replace(
@@ -111,15 +127,12 @@ g1_wbt_terrain_ref = replace(
             urdf_file="g1/main_mesh_arm_collision_halfspherehand.urdf",
         ),
     ),
-    # Ref routes position targets to IsaacSim's built-in PD drive via
-    # JointPositionTargetActionTerm (not the explicit-PD JointPositionActionTerm
-    # inherited from g1_29dof_wbt).
-    action=g1_29dof_joint_pos_implicit,
-    observation=g1_29dof_wbt_terrain_observation,
-    termination=g1_29dof_wbt_terrain_termination,
-    randomization=g1_29dof_wbt_terrain_randomization,
+    action=wbt_joint_pos_implicit,
+    observation=wbt_terrain_observation,
+    randomization=wbt_terrain_randomization,
     command=g1_29dof_wbt_terrain_command,
     reward=g1_29dof_wbt_terrain_reward,
+    termination=g1_29dof_wbt_terrain_termination,
 )
 
 # Terrain preset without the height_scan oracle: actor/critic drop those 289
@@ -128,7 +141,7 @@ g1_wbt_terrain_ref = replace(
 # without the heightmap sensor.
 g1_wbt_terrain_no_heightscan = replace(
     g1_wbt_terrain_ref,
-    observation=g1_29dof_wbt_terrain_observation_no_heightscan,
+    observation=wbt_terrain_observation_no_heightscan,
     algo=replace(
         g1_wbt_terrain_ref.algo,
         config=replace(g1_wbt_terrain_ref.algo.config, num_learning_iterations=60000),
@@ -224,25 +237,19 @@ _distill_algo_base = DistillationPPOAlgoConfig(
     ),
 )
 
-# Finetune = PPO ramps up from iter 0 to iter 10000 (plateau at 0.9).
-# Build on *_noscale* so action_scale=1.0 and action_scales_by_effort_limit_over_p_gain=False
-# match the noscale teacher checkpoints. Using the scaled base here would silently
-# apply a 0.25*effort/kp factor that the teacher was never trained with.
-#
-# num_variants dropped 64 → 3 to match far-tracking's Warp-Distillation-*
-# recipe (distillation_env_cfg.py:382). Fewer obstacle variants per motion
-# lets the student see each layout more often, cutting early-training BC
-# loss — 64 made the student chase a much harder distribution.
-_distill_preprocess_hook_kwargs = json.dumps(
-    {"add_onpath_obstacle": True, "num_variants": 3}
+# Students use the same recipe with 2048 envs and three obstacle layouts per motion.
+_student_training = replace(
+    _teacher_training,
+    num_envs=2048,
+    preprocess_hook_kwargs=json.dumps({"add_onpath_obstacle": True, "num_variants": 3}),
 )
 
 g1_wbt_terrain_warp_distill_finetune = replace(
     g1_wbt_terrain_ref_noscale,
     training=replace(
         g1_wbt_terrain_ref_noscale.training,
-        num_envs=2048,
-        preprocess_hook_kwargs=_distill_preprocess_hook_kwargs,
+        num_envs=_student_training.num_envs,
+        preprocess_hook_kwargs=_student_training.preprocess_hook_kwargs,
     ),
     algo=_distill_algo_base,
     command=g1_29dof_wbt_terrain_distill_command,
@@ -289,6 +296,32 @@ g1_wbt_terrain_warp_distill = replace(
     g1_wbt_terrain_warp_distill_finetune, algo=_distill_algo_pure
 )
 
+t2_wbt_terrain_ref = ExperimentConfig(
+    **_terrain_settings,
+    training=replace(_teacher_training, name="t2_terrain_teacher"),
+    algo=_teacher_algo,
+    robot=t2_robot,
+    action=wbt_joint_pos_implicit,
+    observation=wbt_terrain_observation,
+    randomization=wbt_terrain_randomization,
+    curriculum=wbt_terrain_curriculum,
+    command=t2_terrain_command,
+    reward=t2_terrain_reward,
+    termination=t2_terrain_termination,
+)
+t2_wbt_terrain_warp_distill_finetune = replace(
+    t2_wbt_terrain_ref,
+    training=replace(_student_training, name="t2_depth_student_finetune"),
+    algo=_distill_algo_base,
+    command=t2_distill_command,
+    observation=t2_distill_observation,
+    curriculum=t2_distill_curriculum,
+)
+t2_wbt_terrain_warp_distill = replace(
+    t2_wbt_terrain_warp_distill_finetune,
+    training=replace(_student_training, name="t2_depth_student"),
+    algo=_distill_algo_pure,
+)
 
 DEFAULTS = {
     # Terrain preset for dense WBT with on-path obstacle injection
@@ -305,6 +338,9 @@ DEFAULTS = {
     "g1_wbt_terrain_warp_distill": g1_wbt_terrain_warp_distill,
     # Depth distillation: DAgger + PPO combined-loss finetune.
     "g1_wbt_terrain_warp_distill_finetune": g1_wbt_terrain_warp_distill_finetune,
+    "t2_wbt_terrain_ref": t2_wbt_terrain_ref,
+    "t2_wbt_terrain_warp_distill": t2_wbt_terrain_warp_distill,
+    "t2_wbt_terrain_warp_distill_finetune": t2_wbt_terrain_warp_distill_finetune,
 }
 
 AnnotatedExperimentConfig = Annotated[

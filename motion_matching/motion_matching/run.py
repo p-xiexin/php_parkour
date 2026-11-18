@@ -4,17 +4,20 @@ Motion Matching integration and visualization using viser.
 """
 
 import argparse
+import json
 import multiprocessing
 import os
-from pathlib import Path
 import time
+from dataclasses import replace
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Optional
 
 import numpy as np
 
 import motion_matching.utils.animation_state as mm_utils
 import motion_matching.utils.math_utils as math
+from motion_matching.configs import MotionMatchingConfig, load_motion_matching_config
 from motion_matching.core.database import MotionMatchingDatabase, database_search_fixed
 from motion_matching.core.features import (
     forward_kinematics,
@@ -45,7 +48,7 @@ from motion_matching.scenarios.skill_registry import (
     SKILL_REGISTRY,
     resolve_paths,
 )
-from motion_matching.utils import db_path
+from motion_matching.utils import DATABASE_DIR, PKG_ROOT, db_path
 from motion_matching.utils.data_utils import (
     adjust_data_speed,
     adjust_vel_cmd_speed,
@@ -227,8 +230,18 @@ def collect_required_skills(scenarios: list[dict[str, Any]]) -> set[str]:
 class MotionMatchingSystem:
     def __init__(self, required_skills: Optional[Any] = None, *,
                  robot_spec: Optional[Any] = None, registry: Optional[dict] = None,
-                 database_dir: Optional[Any] = None) -> None:
+                 database_dir: Optional[Any] = None,
+                 contact_bundle_dir: Optional[Any] = None,
+                 inertialize_blending_halflife: Optional[float] = None,
+                 config: Optional[MotionMatchingConfig] = None) -> None:
+        self.robot_id = robot_spec.robot_id if robot_spec is not None else "g1"
+        self.config = load_motion_matching_config(self.robot_id) if config is None else config
+        if inertialize_blending_halflife is not None:
+            self.config = replace(self.config, inertialize_blending_halflife=float(inertialize_blending_halflife))
         self.robot_spec = robot_spec
+        self.database_dir = Path(database_dir).resolve() if database_dir is not None else None
+        self.contact_bundle_dir = (Path(contact_bundle_dir).resolve() if contact_bundle_dir is not None else
+                                   Path(str(self.database_dir) + "_contacts") if self.database_dir is not None else None)
         self.bone_left_foot = robot_spec.bone_left_foot if robot_spec is not None else bone_left_foot
         self.bone_right_foot = robot_spec.bone_right_foot if robot_spec is not None else bone_right_foot
         self.db, self.traversal_dbs, self.traversal_skills = init_databases(
@@ -238,9 +251,10 @@ class MotionMatchingSystem:
 
     def reset(self) -> None:
         # Initialize simulation state (full C++ style)
+        self.record_match = None
         # Get initial frame index (like C++)
         self.frame_idx = self.db.range_starts[0]  # Start from first range
-        self.inertialize_blending_halflife = 0.1
+        self.inertialize_blending_halflife = self.config.inertialize_blending_halflife
 
         self.curr_bone_positions = self.db.bone_positions[self.frame_idx].copy()
         self.curr_bone_velocities = self.db.bone_velocities[self.frame_idx].copy()
@@ -281,7 +295,7 @@ class MotionMatchingSystem:
         )
 
         # Trajectory & Gameplay Data
-        self.search_time = 0.1
+        self.search_time = self.config.search_time
         self.search_timer = self.search_time
         self.force_search_timer = self.search_time
 
@@ -301,8 +315,8 @@ class MotionMatchingSystem:
         self.simulation_rotation = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
         self.simulation_angular_velocity = np.zeros(3, dtype=np.float32)
 
-        self.simulation_velocity_halflife = 0.27
-        self.simulation_rotation_halflife = 0.27
+        self.simulation_velocity_halflife = self.config.simulation_velocity_halflife
+        self.simulation_rotation_halflife = self.config.simulation_rotation_halflife
 
         # Scalar target speed (m/s) for locomotion in interactive mode. Set by
         # the main loop based on the speed-toggle state; kept on self so the
@@ -321,8 +335,8 @@ class MotionMatchingSystem:
 
         # Contact and Foot Locking data
         self.contact_bones = np.array([self.bone_left_foot, self.bone_right_foot], dtype=np.int32)
-        self.contact_states = np.zeros((2), dtype=np.bool)
-        self.contact_locks = np.zeros((2), dtype=np.bool)
+        self.contact_states = np.zeros((2), dtype=np.bool_)
+        self.contact_locks = np.zeros((2), dtype=np.bool_)
         self.contact_positions = np.zeros((2, 3), dtype=np.float32)
         self.contact_velocities = np.zeros((2, 3), dtype=np.float32)
         self.contact_points = np.zeros((2, 3), dtype=np.float32)
@@ -652,6 +666,7 @@ class MotionMatchingSystem:
                 best_cost=float("inf"),
                 db=traversal_db,
                 query=query,
+                ignore_range_end=self.config.ignore_range_end,
                 custom_search_ranges=traversal_db.custom_search_ranges,
             )
 
@@ -699,6 +714,7 @@ class MotionMatchingSystem:
                 bone_dst_velocities=self.trns_bone_velocities,
                 bone_dst_rotations=self.trns_bone_rotations,
                 bone_dst_angular_velocities=self.trns_bone_angular_velocities,
+                correct_state_transfer=self.robot_id == "t2",
             )
             # transition_dst_position has just absorbed the corrected root;
             # the inertializer will reproduce that position next tick, so
@@ -818,7 +834,10 @@ class MotionMatchingSystem:
             elif force_search or self.search_timer <= 0.0 or end_of_anim:
                 ran_search = True
                 best_index, best_cost = database_search_fixed(
-                    best_index=best_index, best_cost=best_cost, db=self.db, query=query
+                    best_index=best_index, best_cost=best_cost, db=self.db, query=query,
+                    transition_cost=self.config.transition_cost,
+                    ignore_range_end=self.config.ignore_range_end,
+                    ignore_surrounding=self.config.ignore_surrounding,
                 )
                 # print("best_index: ", best_index, "best_cost: ", best_cost)
 
@@ -843,6 +862,7 @@ class MotionMatchingSystem:
                         bone_dst_velocities=self.trns_bone_velocities,
                         bone_dst_rotations=self.trns_bone_rotations,
                         bone_dst_angular_velocities=self.trns_bone_angular_velocities,
+                        correct_state_transfer=self.robot_id == "t2",
                     )
                     # See note above: the inertializer absorbed the
                     # corrected root, so zero the standalone offset.
@@ -1091,6 +1111,9 @@ class MotionMatchingSystem:
 
         self._update_ground_path()
 
+        if self.record_match is not None:
+            self.record_match(self, curr_db)
+
         return self.bone_positions, self.bone_rotations
 
     def _update_ground_path(self) -> None:
@@ -1331,34 +1354,32 @@ def generate_skill_sequence(
 
 
 _worker_sys = None
-# Set by run_generation BEFORE the pool is constructed so spawned workers
-# inherit the value via module-import (workers re-import this module on spawn).
-_worker_required_skills = None
 
 
-def init_worker(required_skills: Optional[Any] = None) -> None:
-    """Pool initializer: build the per-worker :class:`MotionMatchingSystem`.
-
-    Args:
-        required_skills: Optional iterable of skill names. If supplied, only
-            those skills + locomotion are loaded; saves significant memory and
-            startup time when a scenario only needs a few skills. Defaults to
-            ``_worker_required_skills`` if unset (so the pool dispatcher can
-            stash the value before creating the pool).
-    """
+def init_worker(required_skills: Optional[Any] = None, robot: str = 'g1',
+                database_dir=None, model_path=None, config_path=None,
+                contact_bundle_dir=None) -> None:
+    """Load the requested skills and robot profile in each generation worker."""
     global _worker_sys
-    if required_skills is None:
-        required_skills = _worker_required_skills
-    try:
-        _worker_sys = MotionMatchingSystem(required_skills=required_skills)
-    except Exception as e:
-        print(f"Error initializing worker: {e}")
-        raise e
+    spec, registry = None, None
+    if robot == 't2':
+        from motion_matching.robots.t2 import make_t2_spec
+
+        model_path = model_path or PKG_ROOT / 'assets/robots/booster_t2/mjcf/t2_31dof_sphere_locked.xml'
+        spec = make_t2_spec(model_path)
+        registry = json.loads((Path(database_dir) / 'registry.json').read_text())
+    _worker_sys = MotionMatchingSystem(
+        required_skills=required_skills, robot_spec=spec, registry=registry,
+        database_dir=database_dir, contact_bundle_dir=contact_bundle_dir,
+        config=load_motion_matching_config(robot, config_path))
 
 
-def process_scenario(scenario: dict[str, Any], folder: str, force: bool, speed_up_ratio: float) -> None:
+def process_scenario(scenario: dict[str, Any], folder: str, force: bool, speed_up_ratio: float,
+                     *, target_fps: Optional[int] = None, terrain_rng: Optional[Any] = None) -> None:
     global _worker_sys, num_terrain_variants
     sys = _worker_sys
+    if target_fps is None:
+        target_fps = sys.config.output_fps
 
     name = scenario["name"]
     filename = f"{name}_motion.npz"
@@ -1371,12 +1392,19 @@ def process_scenario(scenario: dict[str, Any], folder: str, force: bool, speed_u
 
     sys.reset()
     sys.terrain_meshes_to_add = []  # Clear terrain meshes
+    postprocessor = None
+    if sys.robot_id == "t2":
+        if speed_up_ratio != 1.0 or target_fps != 60:
+            raise ValueError("Constrained T2 trajectories must retain their native 60 Hz timing")
+        from motion_matching.postprocessing import T2Postprocessor
+        postprocessor = T2Postprocessor(
+            sys.robot_spec, sys.database_dir, sys.contact_bundle_dir)
+        sys.record_match = postprocessor.record
 
     print(f"Generating {name}...")
 
     all_qpos = []
     all_vel_cmd = []
-
     for step in scenario["steps"]:
         step_type = step["type"]
 
@@ -1412,6 +1440,7 @@ def process_scenario(scenario: dict[str, Any], folder: str, force: bool, speed_u
             all_qpos.append(qpos)
             all_vel_cmd.append(vel)
 
+    sys.record_match = None
     if not all_qpos:
         print(f"  No segments generated for {name}.")
         return
@@ -1419,15 +1448,15 @@ def process_scenario(scenario: dict[str, Any], folder: str, force: bool, speed_u
     qpos = np.concatenate(all_qpos, axis=0)
     vel_cmd = np.concatenate(all_vel_cmd, axis=0)
 
-    required_fps = 50
-    qpos = adjust_data_speed(qpos, speed_up_ratio)
-    vel_cmd = adjust_vel_cmd_speed(vel_cmd, speed_up_ratio)
+    required_fps = int(target_fps)
+    if speed_up_ratio != 1.0 or sys.robot_spec is None:
+        qpos = adjust_data_speed(qpos, speed_up_ratio)
+        vel_cmd = adjust_vel_cmd_speed(vel_cmd, speed_up_ratio)
     vel_cmd = resample_vel_cmd(vel_cmd, required_fps, original_fps=60)
 
     # Some locomotion scenarios request nearby clutter after their final root
     # trajectory is known. This terrain is deliberately post-processed: it must
     # not influence which motion-matching frames are selected.
-    terrain_rng = None
     offpath_variant_cfg = None
     offpath_cfg = scenario.get("offpath_obstacles")
     if offpath_cfg is not None:
@@ -1455,19 +1484,35 @@ def process_scenario(scenario: dict[str, Any], folder: str, force: bool, speed_u
         sys.terrain_meshes_to_add.extend(offpath_obstacles)
         print(f"Added {len(offpath_obstacles)} off-path box obstacles")
 
+    if postprocessor is not None:
+        reference_boxes = [{key: np.asarray(meta[key]).tolist() for key in ("pos", "quat", "size")}
+                           for _, _, _, meta in sys.terrain_meshes_to_add]
+        qpos = postprocessor.process(reference_boxes)
+
     save_motion_npz(qpos, output_file, target_fps=required_fps, source_fps=60, vel_cmd=vel_cmd,
                     robot_spec=sys.robot_spec)
     print(f"Saved to {output_file}")
 
     # Save terrain
-    posed_meshes = [(mesh, pos, rot) for mesh, pos, rot, _ in sys.terrain_meshes_to_add]
+    terrain_metadata = [metadata for _, _, _, metadata in sys.terrain_meshes_to_add]
+    if sys.robot_id == "t2":
+        import trimesh
+        posed_meshes = [(trimesh.creation.box(extents=meta["size"]), meta["pos"], meta["quat"])
+                       for meta in terrain_metadata]
+    else:
+        posed_meshes = [(mesh, pos, rot) for mesh, pos, rot, _ in sys.terrain_meshes_to_add]
     combined_mesh = build_combined_terrain_mesh(posed_meshes)
     mesh_filename = output_file.replace("_motion.npz", "_terrain.obj")
     combined_mesh.export(mesh_filename)
 
     # Save terrain npy
-    terrain_metadata = [metadata for _, _, _, metadata in sys.terrain_meshes_to_add]
-    if offpath_variant_cfg is not None:
+    if sys.robot_id == "t2":
+        # Every slot denotes the same physical scene used by the trajectory
+        # solve. Keep the existing variant dimension for downstream bundles.
+        parameters = np.asarray([np.concatenate([meta["pos"], meta["quat"], meta["size"]])
+                                 for meta in terrain_metadata], dtype=float).reshape(-1, 10)
+        random_terrains = np.repeat(parameters[:, None, :], num_terrain_variants, axis=1)
+    elif offpath_variant_cfg is not None:
         random_terrains = randomize_offpath_terrain_variants(
             terrain_metadata,
             qpos[:, 4:6],
@@ -1488,7 +1533,7 @@ def process_scenario(scenario: dict[str, Any], folder: str, force: bool, speed_u
 def run_generation(args: argparse.Namespace) -> None:
     # sys = MotionMatchingSystem() # Instantiated in workers
 
-    folder = os.path.join("motion_matching_results", args.scenario)
+    folder = str(args.output_dir or Path("motion_matching_results") / args.scenario)
     if args.force:
         import shutil
 
@@ -1521,6 +1566,21 @@ def run_generation(args: argparse.Namespace) -> None:
     required_skills = collect_required_skills(scenarios)
     print(f"Required skills for this scenario: {sorted(required_skills) or '(none, locomotion-only)'}")
 
+    bank = args.database_dir
+    model = args.model
+    contacts = args.contact_bundle_dir
+    if args.robot == 't2':
+        from motion_matching.postprocessing import export_contact_bundle
+        from motion_matching.robots.t2 import make_t2_spec
+
+        bank = Path(bank or DATABASE_DIR).resolve()
+        model = model or PKG_ROOT / 'assets/robots/booster_t2/mjcf/t2_31dof_sphere_locked.xml'
+        contacts = contacts or bank.with_name(bank.name + '_contacts')
+        if not contacts.exists():
+            export_contact_bundle(bank, bank.with_name(bank.name + '_work'),
+                                  make_t2_spec(model), contacts)
+    worker_args = (required_skills, args.robot, bank, model, args.config, contacts)
+
     # Prepare tasks
     tasks = [(scenario, folder, args.force, speed_up_ratio) for scenario in scenarios]
 
@@ -1532,7 +1592,7 @@ def run_generation(args: argparse.Namespace) -> None:
 
     if num_jobs <= 1:
         print(f"Running in-process ({len(tasks)} task(s), no pool overhead).")
-        init_worker(required_skills=required_skills)  # populates module-level _worker_sys
+        init_worker(*worker_args)  # populates module-level _worker_sys
         for task in tasks:
             process_scenario(*task)
     else:
@@ -1540,7 +1600,7 @@ def run_generation(args: argparse.Namespace) -> None:
         # Use spawn context for safety with libraries like numpy/viser/trimesh
         # that hold internal locks; fork would be faster but unsafe on macOS.
         ctx = multiprocessing.get_context("spawn")
-        with ctx.Pool(processes=num_jobs, initializer=init_worker, initargs=(required_skills,)) as pool:
+        with ctx.Pool(processes=num_jobs, initializer=init_worker, initargs=worker_args) as pool:
             pool.starmap(process_scenario, tasks)
 
     print("Generation complete.")
@@ -2077,10 +2137,18 @@ def main() -> None:
     parser.add_argument("--scenario", type=str, help="Name of the scenario function in motion_matching.scenarios")
     parser.add_argument("--force", action="store_true", help="Force overwrite existing generated files")
     parser.add_argument("--jobs", type=int, default=0, help="Number of parallel jobs (default: 0 = all CPUs)")
+    parser.add_argument("--robot", choices=("g1", "t2"), default="g1", help="Robot for headless generation")
+    parser.add_argument("--database-dir", type=Path, help="BIN bank and feature-cache directory")
+    parser.add_argument("--model", type=Path, help="T2 MJCF; defaults to the locked-wrist sphere-hand model")
+    parser.add_argument("--config", type=Path, help="Optional JSON overrides for numeric matching parameters")
+    parser.add_argument("--contact-bundle-dir", type=Path, help="T2 contact bundle; defaults to <bank>_contacts")
+    parser.add_argument("--output-dir", type=Path, help="Directory for generated motions and terrain")
 
     args = parser.parse_args()
 
     if args.mode == "interactive":
+        if args.robot != "g1":
+            parser.error("T2 is supported in --mode generate; use motion_visualizer to view its output")
         run_interactive(args)
     else:
         run_generation(args)

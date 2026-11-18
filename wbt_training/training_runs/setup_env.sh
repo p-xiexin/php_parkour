@@ -106,6 +106,10 @@ php_setup_environment() {
         git submodule update --init --recursive
     fi
     [[ -f "$holosoma_dir/scripts/setup_isaacsim.sh" ]] || { php_error "Holosoma setup not found in $holosoma_dir"; return 1; }
+    local training_patch="$PHP_REPO_ROOT/wbt_training/holosoma_training.patch"
+    if ! git -C "$holosoma_dir" apply --reverse --check "$training_patch" 2>/dev/null; then
+        git -C "$holosoma_dir" apply "$training_patch"
+    fi
     CONDA_ENV_NAME="${ENV_NAME:-php}" bash "$holosoma_dir/scripts/setup_isaacsim.sh"
     php_activate_sim
     "$HSSIM_PYTHON" -m pip install -e "$PHP_REPO_ROOT"

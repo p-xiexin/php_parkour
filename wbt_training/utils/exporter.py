@@ -260,12 +260,12 @@ def build_metadata_from_wbt_env(env, run_path: str = "") -> dict[str, Any]:
     """Extract ONNX metadata from a holosoma ``WholeBodyTrackingManager`` env.
 
     Emits both ``joint_stiffness``/``joint_damping`` and ``kp``/``kd`` for
-    inference readers using either spelling, pointing at the same
-    values. Fields that aren't available on the env are omitted silently;
-    the three critical keys (``joint_names``, ``action_scale``,
-    ``default_joint_pos``) raise a clear error instead.
+    inference readers using either spelling, pointing at the same values.
+    Joint order, action scales, default pose, control period and PD gains
+    come from the training environment.
     """
     metadata: dict[str, Any] = {"run_path": run_path}
+    metadata["control_dt"] = float(env.dt)
 
     # Critical: joint_names (drives inference joint reordering)
     try:
@@ -273,22 +273,7 @@ def build_metadata_from_wbt_env(env, run_path: str = "") -> dict[str, Any]:
     except AttributeError as e:
         raise RuntimeError(f"env.robot_config.dof_names not available: {e}") from e
 
-    # The distill preset registers the action under "joint_control"
-    # (config_values/terrain.py:309-318); fall back to the first registered
-    # term so this keeps working if upstream renames it.
-    action_term = None
-    for candidate in ("joint_control", "joint_pos"):
-        try:
-            action_term = env.action_manager.get_term(candidate)
-            break
-        except KeyError:
-            continue
-    if action_term is None:
-        names = list(getattr(env.action_manager, "_term_instances", {}).keys())
-        if names:
-            action_term = env.action_manager.get_term(names[0])
-        else:
-            raise RuntimeError("env.action_manager has no registered action terms")
+    action_term = env.action_manager.get_term("joint_control")
 
     # Critical: action_scale (holosoma stores a per-joint tensor; emit as list)
     try:
@@ -296,62 +281,30 @@ def build_metadata_from_wbt_env(env, run_path: str = "") -> dict[str, Any]:
     except AttributeError as e:
         raise RuntimeError(f"action_term.action_scales not available: {e}") from e
 
-    # Critical: default_joint_pos (used by the control-gain fallback)
-    try:
-        # Prefer the non-randomised canonical pose if available. Both
-        # `default_dof_pos_base` (1D) and `default_dof_pos` (2D, per-env)
-        # exist; flatten so the CSV writer formats floats instead of falling
-        # through to ``str(inner_list)``.
-        if hasattr(env, "default_dof_pos_base"):
-            flat = env.default_dof_pos_base.flatten().cpu().tolist()
-        else:
-            flat = env.default_dof_pos[0].flatten().cpu().tolist()
-        metadata["default_joint_pos"] = flat
-    except AttributeError as e:
-        raise RuntimeError(f"env.default_dof_pos not available: {e}") from e
+    metadata["default_joint_pos"] = env.default_dof_pos_base.flatten().cpu().tolist()
 
-    # Optional: control gains. ``JointPositionTargetActionTerm`` (implicit PD)
-    # doesn't expose ``p_gains``/``d_gains`` because the gains live on the
-    # articulation drive, not the action term — ``robot_config.control``
-    # holds them in a dict keyed by joint *group* (e.g. ``hip_yaw`` matches
-    # ``left_hip_yaw_joint``). Resolve per joint using substring match, the
-    # same convention the action term uses to derive ``action_scales``
-    # (joint_control.py:46-53).
-    p_gains = d_gains = None
+    # Explicit PD exposes gains on the action term. Implicit PD uses the
+    # robot config: exact joint names for T2, joint groups for G1.
     if hasattr(action_term, "p_gains"):
-        try:
-            p_gains = action_term.p_gains.cpu().tolist()
-            d_gains = action_term.d_gains.cpu().tolist()
-        except AttributeError:
-            p_gains = d_gains = None
-    if p_gains is None:
-        try:
-            stiffness = env.robot_config.control.stiffness
-            damping = env.robot_config.control.damping
-            dof_names = list(env.robot_config.dof_names)
+        p_gains = action_term.p_gains.cpu().tolist()
+        d_gains = action_term.d_gains.cpu().tolist()
+    else:
+        stiffness = env.robot_config.control.stiffness
+        damping = env.robot_config.control.damping
+        dof_names = metadata["joint_names"]
 
-            def _resolve(d, name):
-                if not isinstance(d, dict):
-                    return (
-                        float(d[dof_names.index(name)])
-                        if hasattr(d, "__getitem__")
-                        else 0.0
-                    )
-                stripped = name.replace("_joint", "")
-                for k, v in d.items():
-                    if k in stripped:
-                        return float(v)
-                return 0.0
+        def _resolve(gains, name):
+            if name in gains:
+                return float(gains[name])
+            stripped = name.replace("_joint", "")
+            return float(next(value for group, value in gains.items() if group in stripped))
 
-            p_gains = [_resolve(stiffness, n) for n in dof_names]
-            d_gains = [_resolve(damping, n) for n in dof_names]
-        except AttributeError:
-            p_gains = d_gains = None
-    if p_gains is not None:
-        metadata["joint_stiffness"] = p_gains
-        metadata["joint_damping"] = d_gains
-        metadata["kp"] = p_gains
-        metadata["kd"] = d_gains
+        p_gains = [_resolve(stiffness, name) for name in dof_names]
+        d_gains = [_resolve(damping, name) for name in dof_names]
+    metadata["joint_stiffness"] = p_gains
+    metadata["joint_damping"] = d_gains
+    metadata["kp"] = p_gains
+    metadata["kd"] = d_gains
 
     # Optional: command/observation term names
     try:
